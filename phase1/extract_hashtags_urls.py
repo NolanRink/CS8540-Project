@@ -1,7 +1,7 @@
 import json, os
 
 INPUT_FILE = "out.json"
-os.makedirs("part1/extracted", exist_ok=True)
+os.makedirs("phase1/extracted", exist_ok=True)
 
 hashtags, urls = [], []
 
