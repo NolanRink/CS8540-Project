@@ -30,9 +30,9 @@ with open(INPUT_FILE, encoding="utf-8") as f:
         if line.strip():
             extract(json.loads(line))
 
-open("part1/extracted/hashtags.txt", "w").write("\n".join(hashtags))
-open("part1/extracted/urls.txt",     "w").write("\n".join(urls))
-open("part1/extracted/combined.txt", "w").write("\n".join(hashtags + urls))
+open("phase1/extracted/hashtags.txt", "w").write("\n".join(hashtags))
+open("phase1/extracted/urls.txt",     "w").write("\n".join(urls))
+open("phase1/extracted/combined.txt", "w").write("\n".join(hashtags + urls))
 
 
 print(f"Hashtags: \t{len(hashtags)}")
