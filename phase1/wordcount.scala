@@ -1,0 +1,5 @@
+val lines = sc.textFile("/project/combined.txt")
+val words = lines.flatMap(s => s.split(" "))
+val temp = words.map(s => (s,1))
+val counts = temp.reduceByKey((a,b) => a + b)
+counts.collect.foreach(println)
