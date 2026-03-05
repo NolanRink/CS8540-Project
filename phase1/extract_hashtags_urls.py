@@ -7,8 +7,8 @@ hashtags, urls = [], []
 
 def extract(tweet):
     # check both entity blocks
-    for ent in [tweet.get("entities") or {}, (tweet.get("extended_entities") or {})]:
-
+    for ent in [tweet.get("entities") or {}]:
+        
         # collect each hashtag text
         for h in ent.get("hashtags", [] or []):
             if h.get("text"): hashtags.append(f'#{h["text"].lower()}')
