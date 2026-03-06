@@ -94,3 +94,19 @@ https://twitter.com/NaturallyFTW/status/1627664320434667520/photo/1	233
 #bigpharma	231
 https://twitter.com/VidmaxMedia/status/1623679669366136833/video/01	221
 ```
+
+## Spark commands executed
+
+The following sequence of interactive Scala shell commands was used to run the WordCount example with Apache Spark:
+
+```scala
+spark-shell
+
+val lines = sc.textFile("/project/combined.txt")
+val words = lines.flatMap(s => s.split(" "))
+val temp = words.map(s => (s,1))
+val counts = temp.reduceByKey((a,b) => a + b)
+counts.sortBy({ case (word, count) => count }, ascending = false).saveAsTextFile("/project/out_wc_spark_sorted")
+```
+
+**Output location:** `phase1/out_wc_spark_sorted`
