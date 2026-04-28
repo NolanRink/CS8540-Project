@@ -17,10 +17,20 @@ families into GPU-accelerated estimators.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
+import platform
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+log("Starting phase2/scripts/run_ray_forecasting_fabric.py")
+log("Importing forecasting dependencies...")
 
 import numpy as np
 import pandas as pd
@@ -46,17 +56,19 @@ except ModuleNotFoundError:
             self.current = 0
 
         def __enter__(self):
-            print(f"{self.desc}: 0/{self.total} {self.unit}s")
+            log(f"{self.desc}: 0/{self.total} {self.unit}s")
             return self
 
         def update(self, amount: int = 1) -> None:
             self.current += amount
-            print(f"{self.desc}: {self.current}/{self.total} {self.unit}s")
+            log(f"{self.desc}: {self.current}/{self.total} {self.unit}s")
 
         def __exit__(self, exc_type, exc_value, traceback) -> None:
             return None
 
 import config
+
+log("Dependency imports complete.")
 
 
 RUN_CONFIG: dict[str, Any] = {
@@ -97,11 +109,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
     parser.add_argument("--num-cpus", type=int, default=None, help="Total CPUs available to Ray.")
     parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Validate paths, data loading, environment reporting, and Ray startup without model training.",
+    )
+    parser.add_argument(
         "--use-gpu",
         action="store_true",
-        help="Make Ray GPU-resource aware if GPUs are visible. Sklearn models remain CPU-bound.",
+        help="Report GPU/CUDA status. Sklearn models remain CPU-bound, so GPU is not reserved by default.",
+    )
+    parser.add_argument(
+        "--reserve-gpu-resource",
+        action="store_true",
+        help="Reserve fractional Ray GPU resources for model tasks. Usually unnecessary for sklearn models.",
     )
     return parser.parse_args()
+
+
+def package_version(package_name: str) -> str:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def report_environment(use_gpu: bool) -> None:
+    log("Environment:")
+    log(f"  Python: {sys.version.split()[0]} ({platform.system()} {platform.release()})")
+    log(f"  pandas: {package_version('pandas')}")
+    log(f"  numpy: {package_version('numpy')}")
+    log(f"  scikit-learn: {package_version('scikit-learn')}")
+    log(f"  pyarrow: {package_version('pyarrow')}")
+    log(f"  ray: {package_version('ray')}")
+    log(f"  torch: {package_version('torch')}")
+    log(f"  GPU requested: {use_gpu}")
+
+    if use_gpu:
+        log("Checking torch CUDA availability...")
+        try:
+            import torch
+
+            log(f"  torch.cuda.is_available(): {torch.cuda.is_available()}")
+            log(f"  torch.cuda.device_count(): {torch.cuda.device_count()}")
+            if torch.cuda.is_available():
+                log(f"  CUDA device 0: {torch.cuda.get_device_name(0)}")
+        except Exception as exc:  # pragma: no cover - environment-specific diagnostics
+            log(f"  CUDA check failed: {exc}")
+
+    log("Note: current sklearn forecasting models are CPU-bound even on GPU-capable VMs.")
 
 
 def require_columns(frame: pd.DataFrame, columns: list[str], label: str) -> None:
@@ -130,10 +185,14 @@ def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str
 
 
 def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
+    log("Checking feature table path...")
+    log(f"  {feature_path}")
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
+    log("Loading feature table parquet...")
     features = pd.read_parquet(feature_path)
+    log(f"Loaded feature table with {len(features):,} rows and {len(features.columns):,} columns.")
     required = [
         "date",
         "tag",
@@ -146,6 +205,7 @@ def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
         *config.CATEGORICAL_FEATURES,
     ]
     require_columns(features, required, "feature table")
+    log("Feature table columns validated.")
 
     modeling = (
         features.loc[features["modeling_ready"]]
@@ -158,6 +218,7 @@ def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
     if split_counts != RUN_CONFIG["expected_split_counts"]:
         raise ValueError(f"Unexpected modeling split counts: {split_counts}")
 
+    log(f"Modeling-ready rows: {len(modeling):,}")
     return modeling
 
 
@@ -222,6 +283,7 @@ def make_pipeline(model_config: dict[str, Any]) -> Pipeline:
 
 
 def make_baseline_outputs(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    log("Building baseline predictions and metrics...")
     predictions = modeling[["date", "tag", "tag_type", "count", config.TARGET_COLUMN, "split"]].copy()
     predictions["baseline_last_value"] = modeling["count"].astype(float)
     predictions["baseline_rolling_mean_3"] = modeling["rolling_mean_3"].astype(float)
@@ -274,6 +336,7 @@ def make_baseline_outputs(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
                 }
             )
     by_tag_type = pd.DataFrame(by_type_rows).sort_values(["split", "tag_type", "MAE"])
+    log("Baseline outputs built.")
     return predictions, overall, by_tag, by_tag_type
 
 
@@ -316,37 +379,62 @@ def train_model_worker(
     }
 
 
-def choose_ray_resources(num_workers: int, num_cpus: int | None, use_gpu: bool) -> tuple[int, float]:
+def choose_ray_resources(
+    num_workers: int,
+    num_cpus: int | None,
+    use_gpu: bool,
+    reserve_gpu_resource: bool,
+) -> tuple[int, float]:
     """Start Ray and choose simple per-worker resources."""
+    if num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if num_cpus is not None and num_cpus < 1:
+        raise ValueError("--num-cpus must be at least 1 when provided")
+
     total_cpus = num_cpus or max(1, num_workers)
     if ray.is_initialized():
+        log("Ray was already initialized; shutting it down before this run.")
         ray.shutdown()
 
+    log("Initializing Ray...")
+    log(f"  requested total CPUs: {total_cpus}")
+    log(f"  requested workers: {num_workers}")
+    log(f"  GPU status requested: {use_gpu}")
+    log(f"  reserve GPU resource for sklearn tasks: {reserve_gpu_resource}")
     ray.init(
         include_dashboard=False,
         ignore_reinit_error=True,
         log_to_driver=False,
         num_cpus=total_cpus,
     )
+    log("Ray initialized.")
 
     cluster_resources = ray.cluster_resources()
+    log(f"Ray cluster resources: {cluster_resources}")
     visible_gpus = float(cluster_resources.get("GPU", 0.0))
 
-    if use_gpu and visible_gpus > 0:
+    if reserve_gpu_resource and visible_gpus > 0:
         gpus_per_worker = min(1.0, visible_gpus / max(1, num_workers))
-        print(
+        log(
             f"Ray sees {visible_gpus:g} GPU resource(s); reserving "
             f"{gpus_per_worker:g} GPU per model task."
         )
-        print("Note: the current sklearn models are CPU-bound and do not perform GPU training.")
+        log("Note: the current sklearn models are CPU-bound and do not perform GPU training.")
+    elif reserve_gpu_resource:
+        gpus_per_worker = 0.0
+        log("No Ray GPU resources were detected; continuing safely on CPU.")
+    elif use_gpu and visible_gpus > 0:
+        gpus_per_worker = 0.0
+        log(f"Ray sees {visible_gpus:g} GPU resource(s), but GPU resources will not be reserved for CPU-bound sklearn tasks.")
     elif use_gpu:
         gpus_per_worker = 0.0
-        print("No Ray GPU resources were detected; continuing safely on CPU.")
+        log("No Ray GPU resources were detected; continuing safely on CPU.")
     else:
         gpus_per_worker = 0.0
-        print("Running Ray model tasks with CPU resources.")
+        log("Running Ray model tasks with CPU resources.")
 
     cpus_per_worker = max(1, total_cpus // max(1, num_workers))
+    log(f"Per-model task resources: {cpus_per_worker} CPU(s), {gpus_per_worker:g} GPU(s)")
     return cpus_per_worker, gpus_per_worker
 
 
@@ -355,14 +443,20 @@ def run_ray_model_comparison(
     num_workers: int,
     num_cpus: int | None,
     use_gpu: bool,
+    reserve_gpu_resource: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    log("Preparing train/validation/test frames for Ray model comparison...")
     train = modeling[modeling["split"] == "train"].copy()
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
+    log(f"  train rows: {len(train):,}")
+    log(f"  validation rows: {len(validation):,}")
+    log(f"  test rows: {len(test):,}")
 
-    cpus_per_worker, gpus_per_worker = choose_ray_resources(num_workers, num_cpus, use_gpu)
+    cpus_per_worker, gpus_per_worker = choose_ray_resources(num_workers, num_cpus, use_gpu, reserve_gpu_resource)
 
     try:
+        log("Submitting Ray model jobs...")
         futures = [
             train_model_worker.options(
                 num_cpus=cpus_per_worker,
@@ -370,6 +464,7 @@ def run_ray_model_comparison(
             ).remote(model_config, train, validation, test)
             for model_config in MODEL_CONFIGS
         ]
+        log(f"Submitted {len(futures)} model job(s): {[model_config['name'] for model_config in MODEL_CONFIGS]}")
 
         results = []
         with tqdm(total=len(futures), desc="Ray model jobs", unit="model") as progress:
@@ -379,8 +474,10 @@ def run_ray_model_comparison(
                 results.append(ray.get(done[0]))
                 progress.update(1)
     finally:
+        log("Shutting down Ray...")
         ray.shutdown()
 
+    log("Ray model jobs complete.")
     metrics = pd.DataFrame([row for result in results for row in result["metrics"]])
     predictions = pd.concat([result["predictions"] for result in results], ignore_index=True)
     return predictions, metrics
@@ -457,6 +554,7 @@ def save_outputs(
     run_summary: dict[str, Any],
     baseline_outputs: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
 ) -> None:
+    log("Saving output artifacts...")
     config.DERIVED_DIR.mkdir(parents=True, exist_ok=True)
 
     baseline_predictions, baseline_metrics, baseline_by_tag, baseline_by_type = baseline_outputs
@@ -471,16 +569,41 @@ def save_outputs(
     by_tag_type.to_csv(config.RAY_MODEL_METRICS_BY_TAG_TYPE, index=False)
     with open(config.RAY_MODEL_RUN_SUMMARY, "w", encoding="utf-8") as handle:
         json.dump(run_summary, handle, indent=2, default=str)
+    log(f"Saved predictions: {config.RAY_MODEL_PREDICTIONS}")
+    log(f"Saved metrics: {config.RAY_MODEL_METRICS_OVERALL}")
+    log(f"Saved run summary: {config.RAY_MODEL_RUN_SUMMARY}")
 
 
 def main() -> int:
     args = parse_args()
-    print("Running FABRIC-friendly Phase 2 Ray forecasting comparison")
-    print(f"Feature table: {args.features}")
+    log("=" * 72)
+    log("FABRIC Phase 2 Ray forecasting comparison")
+    log("=" * 72)
+    log("Configuration:")
+    log(f"  feature table: {args.features}")
+    log(f"  num workers: {args.num_workers}")
+    log(f"  num CPUs: {args.num_cpus if args.num_cpus is not None else 'auto'}")
+    log(f"  use GPU flag: {args.use_gpu}")
+    log(f"  reserve GPU resource: {args.reserve_gpu_resource}")
+    log(f"  smoke test only: {args.smoke_test}")
+    report_environment(args.use_gpu)
 
     modeling = load_modeling_frame(args.features)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
-    print(f"Modeling rows by split: {split_counts}")
+    log(f"Modeling rows by split: {split_counts}")
+
+    if args.smoke_test:
+        log("Smoke test requested: validating Ray startup without training models.")
+        choose_ray_resources(
+            num_workers=args.num_workers,
+            num_cpus=args.num_cpus,
+            use_gpu=args.use_gpu,
+            reserve_gpu_resource=args.reserve_gpu_resource,
+        )
+        log("Smoke test Ray startup succeeded; shutting down Ray.")
+        ray.shutdown()
+        log("PASS")
+        return 0
 
     baseline_outputs = make_baseline_outputs(modeling)
     baseline_predictions, baseline_metrics, _, _ = baseline_outputs
@@ -490,6 +613,7 @@ def main() -> int:
         num_workers=args.num_workers,
         num_cpus=args.num_cpus,
         use_gpu=args.use_gpu,
+        reserve_gpu_resource=args.reserve_gpu_resource,
     )
     all_predictions, all_metrics = add_baseline_to_comparison(
         learned_predictions,
@@ -535,12 +659,10 @@ def main() -> int:
 
     save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs)
 
-    print(f"Best learned model: {best_model}")
-    print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}")
-    print(f"Test sMAPE: {best_test['sMAPE']:.4f}")
-    print(f"Saved predictions: {config.RAY_MODEL_PREDICTIONS}")
-    print(f"Saved metrics: {config.RAY_MODEL_METRICS_OVERALL}")
-    print("PASS")
+    log(f"Best learned model: {best_model}")
+    log(f"Validation sMAPE: {best_validation['sMAPE']:.4f}")
+    log(f"Test sMAPE: {best_test['sMAPE']:.4f}")
+    log("PASS")
     return 0
 
 
