@@ -1,0 +1,11 @@
+# Ignore raw data files but keep their compressed archives
+tweets.json
+
+# Ignore any other raw JSON data files
+*.json
+
+# Ignore Parquet files (data output)
+*.parquet
+
+# Keep zip files
+!*.zip
