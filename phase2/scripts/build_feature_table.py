@@ -1,4 +1,4 @@
-"""Build the selected-tag daily feature table used by Phase 2 forecasting."""
+"""Build the daily feature table for the selected Phase 2 tags."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ SENTIMENT_DERIVED_COLUMNS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the Phase 2 top-tag feature table.")
+    parser = argparse.ArgumentParser(description="Build the top-tag feature table.")
     parser.add_argument("--spark-output-dir", type=Path, default=SPARK_OUTPUT_DIR)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--include-sentiment", action="store_true", help="Join daily tag sentiment features.")
@@ -268,16 +268,16 @@ def validate_sentiment_feature_table(features: pd.DataFrame) -> None:
 
 def main() -> int:
     args = parse_args()
-    print("Loading Spark daily counts...")
+    print("Loading daily counts")
     daily_counts = load_counts(args.spark_output_dir)
 
-    print("Building top-tag feature table...")
+    print("Building feature table")
     selected_tags = select_top_tags(daily_counts)
     panel = build_panel(daily_counts, selected_tags)
     features = add_features(panel)
 
     if args.include_sentiment:
-        print("Joining daily sentiment features...")
+        print("Adding sentiment features")
         sentiment = load_sentiment_features(args.sentiment_features)
         features = add_sentiment_features(features, sentiment)
 
@@ -292,15 +292,15 @@ def main() -> int:
     if not args.output.exists():
         raise FileNotFoundError(f"Feature table was not saved: {args.output}")
 
-    print(f"Saved feature table to {args.output}")
+    print(f"Saved {args.output}")
     print(f"Rows: {len(features):,}; modeling-ready rows: {int(features['modeling_ready'].sum()):,}")
     if args.include_sentiment:
         covered = int((features["sentiment_tweet_count"] > 0).sum())
         coverage = covered / len(features)
         if coverage < 0.05:
             print(
-                "Warning: sentiment coverage is low "
-                f"({covered:,}/{len(features):,} rows). This is expected for smoke-run sentiment inputs."
+                "Low sentiment coverage: "
+                f"{covered:,}/{len(features):,} rows. That is expected for smoke-test sentiment files."
             )
     return 0
 

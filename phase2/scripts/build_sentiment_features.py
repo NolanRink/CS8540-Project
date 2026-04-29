@@ -1,4 +1,4 @@
-"""Score cleaned tweets with a financial sentiment model and aggregate by day/tag."""
+"""Score cleaned tweets and roll sentiment up by day and tag."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ REQUIRED_TWEET_COLUMNS = ["date", "text", "hashtags", "cashtags"]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build Phase 2 tweet and daily tag sentiment features.")
+    parser = argparse.ArgumentParser(description="Build tweet and daily tag sentiment features.")
     parser.add_argument("--input", type=Path, default=CLEANED_TWEETS)
     parser.add_argument("--selected-tags", type=Path, default=SELECTED_TAG_FEATURES)
     parser.add_argument("--tweet-output", type=Path, default=TWEET_OUTPUT)
@@ -345,24 +345,24 @@ def save_outputs(tweet_sentiment: pd.DataFrame, daily_sentiment: pd.DataFrame, a
 def main() -> int:
     args = parse_args()
 
-    print("Loading cleaned tweets...")
+    print("Loading cleaned tweets")
     tweets = load_cleaned_tweets(args.input, args.max_rows)
     selected_tags = load_selected_tags(args.selected_tags)
     print(f"Tweets to score: {len(tweets):,}")
 
-    print(f"Running sentiment model: {args.model_name}")
-    print(f"Using Hugging Face cache: {args.cache_dir}")
+    print(f"Model: {args.model_name}")
+    print(f"HF cache: {args.cache_dir}")
     tweet_sentiment, device_used = build_tweet_sentiment(tweets, args)
 
-    print("Aggregating sentiment by day and tag...")
+    print("Aggregating by date and tag")
     tagged = explode_tag_rows(tweet_sentiment, selected_tags)
     daily_sentiment = aggregate_daily_sentiment(tagged)
 
     save_outputs(tweet_sentiment, daily_sentiment, args)
 
-    print(f"Device used: {device_used}")
-    print(f"Saved tweet sentiment rows: {len(tweet_sentiment):,} -> {args.tweet_output}")
-    print(f"Saved daily tag sentiment rows: {len(daily_sentiment):,} -> {args.daily_output}")
+    print(f"Device: {device_used}")
+    print(f"Saved {len(tweet_sentiment):,} tweet rows -> {args.tweet_output}")
+    print(f"Saved {len(daily_sentiment):,} daily tag rows -> {args.daily_output}")
     return 0
 
 

@@ -1,4 +1,4 @@
-"""Run the Phase 2 baseline and Ray pooled forecasting comparison."""
+"""Run the Phase 2 forecasting baselines and pooled Ray models."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ MODEL_CONFIGS: list[dict[str, Any]] = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Phase 2 Ray forecasting.")
+    parser = argparse.ArgumentParser(description="Run Phase 2 forecasting models.")
     parser.add_argument("--features", type=Path, default=FEATURE_TABLE)
     parser.add_argument("--run-label", default=None, help="Optional label used to save run-specific outputs.")
     parser.add_argument("--include-sentiment", action="store_true", help="Use sentiment numeric features if present.")
@@ -505,31 +505,31 @@ def main() -> int:
     args.run_label = validate_run_label(args.run_label)
     paths = output_paths(args.run_label)
 
-    print("Loading feature table...")
+    print("Loading features")
     modeling, selected_numeric = load_modeling_frame(args.features, args.include_sentiment)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
-    print(f"Modeling rows by split: {split_counts}")
-    print(f"Numeric features: {len(selected_numeric)}")
+    print(f"Rows by split: {split_counts}")
+    print(f"Numeric feature count: {len(selected_numeric)}")
     if args.include_sentiment:
         covered = int((modeling["sentiment_tweet_count"] > 0).sum())
         if covered / len(modeling) < 0.05:
             print(
-                "Warning: sentiment coverage is low "
-                f"({covered:,}/{len(modeling):,} modeling rows). Treat results as pipeline validation only."
+                "Low sentiment coverage: "
+                f"{covered:,}/{len(modeling):,} modeling rows. Treat this as a smoke-test run."
             )
 
     if args.smoke_test:
-        print("Starting Ray smoke test...")
+        print("Checking Ray startup")
         start_ray(args.num_workers, args.num_cpus, args.use_gpu, args.reserve_gpu_resource)
         ray.shutdown()
-        print("Smoke test passed.")
+        print("Ray smoke test passed")
         return 0
 
-    print("Building baseline metrics...")
+    print("Scoring baselines")
     baseline_outputs = make_baseline_outputs(modeling)
     baseline_predictions, baseline_metrics, _, _ = baseline_outputs
 
-    print("Training Ray models...")
+    print("Training Ray models")
     learned_predictions, learned_metrics = run_ray_models(
         modeling,
         selected_numeric,
@@ -583,7 +583,7 @@ def main() -> int:
         "models_compared": learned_names,
     }
 
-    print("Saving outputs...")
+    print("Saving results")
     save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs, paths)
     update_forecast_comparison(all_metrics, args.run_label)
 
