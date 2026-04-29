@@ -1,11 +1,19 @@
-# Ignore raw data files but keep their compressed archives
-tweets.json
-
-# Ignore any other raw JSON data files
-*.json
-
-# Ignore Parquet files (data output)
-*.parquet
-
 # Keep zip files
 !*.zip
+
+# Local Python environments and caches
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Local Spark scratch files and logs
+spark-warehouse/
+metastore_db/
+spark-events/
+derby.log
+
+# Temporary local workspace outputs
+.tmp/
+phase2/tmp/
+phase2/.tmp/
+phase2/scratch/
