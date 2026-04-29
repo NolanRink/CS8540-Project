@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ DAILY_OUTPUT = DERIVED_DIR / "daily_tag_sentiment.parquet"
 START_DATE = "2020-04-09"
 END_DATE = "2020-07-16"
 DEFAULT_MODEL = "StephanAkkerman/FinTwitBERT-sentiment"
+DEFAULT_HF_CACHE_DIR = Path(os.environ.get("HF_HOME", "/mnt/project/cache/hf"))
 REQUIRED_TWEET_COLUMNS = ["date", "text", "hashtags", "cashtags"]
 
 
@@ -38,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=None, help="Optional small-row smoke test limit after date filtering.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_HF_CACHE_DIR)
+    parser.add_argument("--progress-every", type=int, default=500, help="Print progress every N batches; use 0 to disable.")
     return parser.parse_args()
 
 
@@ -136,6 +140,24 @@ def choose_device(requested: str):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def prepare_hf_cache(cache_dir: Path) -> Path:
+    cache_dir = cache_dir.expanduser().resolve()
+    hub_dir = cache_dir / "hub"
+    xet_dir = cache_dir / "xet"
+    datasets_dir = cache_dir / "datasets"
+    for path in [cache_dir, hub_dir, xet_dir, datasets_dir]:
+        path.mkdir(parents=True, exist_ok=True)
+
+    os.environ["HF_HOME"] = str(cache_dir)
+    os.environ["HF_HUB_CACHE"] = str(hub_dir)
+    os.environ["HF_XET_CACHE"] = str(xet_dir)
+    os.environ["HF_DATASETS_CACHE"] = str(datasets_dir)
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ.pop("TRANSFORMERS_CACHE", None)
+    return cache_dir
+
+
 def get_label_mapping(model) -> dict[str, int]:
     labels = {int(index): str(label).lower() for index, label in model.config.id2label.items()}
     mapping: dict[str, int] = {}
@@ -162,18 +184,23 @@ def run_sentiment_inference(
     batch_size: int,
     device_name: str,
     max_length: int,
+    cache_dir: Path,
+    progress_every: int,
 ) -> tuple[pd.DataFrame, str]:
     if batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
     if max_length < 16:
         raise ValueError("--max-length is too small for tweet sentiment inference.")
+    if progress_every < 0:
+        raise ValueError("--progress-every cannot be negative.")
 
+    cache_dir = prepare_hf_cache(cache_dir)
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     device = choose_device(device_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, cache_dir=cache_dir)
     model.to(device)
     model.eval()
 
@@ -182,8 +209,9 @@ def run_sentiment_inference(
 
     rows = []
     text_values = texts.tolist()
+    total_batches = (len(text_values) + batch_size - 1) // batch_size
     with torch.inference_mode():
-        for start in range(0, len(text_values), batch_size):
+        for batch_number, start in enumerate(range(0, len(text_values), batch_size), start=1):
             batch_texts = text_values[start : start + batch_size]
             encoded = tokenizer(
                 batch_texts,
@@ -210,6 +238,8 @@ def run_sentiment_inference(
                         "sentiment_confidence": float(np.max(probs)),
                     }
                 )
+            if progress_every and (batch_number % progress_every == 0 or batch_number == total_batches):
+                print(f"Scored {min(start + batch_size, len(text_values)):,}/{len(text_values):,} tweets", flush=True)
 
     return pd.DataFrame(rows), str(device)
 
@@ -221,6 +251,8 @@ def build_tweet_sentiment(tweets: pd.DataFrame, args: argparse.Namespace) -> tup
         batch_size=args.batch_size,
         device_name=args.device,
         max_length=args.max_length,
+        cache_dir=args.cache_dir,
+        progress_every=args.progress_every,
     )
     if len(scores) != len(tweets):
         raise ValueError(f"Scored row count mismatch: {len(scores)} scores for {len(tweets)} tweets.")
@@ -319,6 +351,7 @@ def main() -> int:
     print(f"Tweets to score: {len(tweets):,}")
 
     print(f"Running sentiment model: {args.model_name}")
+    print(f"Using Hugging Face cache: {args.cache_dir}")
     tweet_sentiment, device_used = build_tweet_sentiment(tweets, args)
 
     print("Aggregating sentiment by day and tag...")
