@@ -109,17 +109,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
     parser.add_argument("--num-cpus", type=int, default=None)
     parser.add_argument("--smoke-test", action="store_true", help="Check data loading and Ray startup without training.")
-    parser.add_argument("--use-gpu", action="store_true", help="Note GPU visibility; sklearn models still run on CPU.")
-    parser.add_argument("--reserve-gpu-resource", action="store_true", help="Reserve Ray GPU resources for tasks if present.")
+    parser.add_argument("--use-gpu", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reserve-gpu-resource", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
-
-
-def validate_run_label(run_label: str | None) -> str | None:
-    if run_label is None:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9_]+", run_label):
-        raise ValueError("--run-label may contain only letters, numbers, and underscores.")
-    return run_label
 
 
 def labeled_path(path: Path, run_label: str | None) -> Path:
@@ -141,12 +133,6 @@ def output_paths(run_label: str | None) -> dict[str, Path]:
         "run_summary": labeled_path(RAY_MODEL_RUN_SUMMARY, run_label),
         "training_times": labeled_path(RAY_MODEL_TRAINING_TIMES, run_label),
     }
-
-
-def require_columns(frame: pd.DataFrame, columns: list[str], label: str) -> None:
-    missing = [col for col in columns if col not in frame.columns]
-    if missing:
-        raise ValueError(f"{label} is missing columns: {missing}")
 
 
 def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
@@ -187,7 +173,9 @@ def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd
         *selected_numeric,
         *CATEGORICAL_FEATURES,
     ]
-    require_columns(features, required, "feature table")
+    missing = [col for col in required if col not in features.columns]
+    if missing:
+        raise ValueError(f"feature table is missing columns: {missing}")
 
     modeling = (
         features.loc[features["modeling_ready"]]
@@ -208,7 +196,7 @@ def make_encoder() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
-def make_model(config: dict[str, Any]):
+def build_model(config: dict[str, Any]):
     kind = config["kind"]
     if kind == "linear_regression":
         return LinearRegression()
@@ -233,7 +221,7 @@ def make_model(config: dict[str, Any]):
     raise ValueError(f"Unknown model kind: {kind}")
 
 
-def make_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str]) -> Pipeline:
+def build_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str]) -> Pipeline:
     preprocessor = ColumnTransformer(
         [
             (
@@ -248,10 +236,10 @@ def make_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str]
             ),
         ]
     )
-    return Pipeline([("preprocess", preprocessor), ("model", make_model(model_config))])
+    return Pipeline([("preprocess", preprocessor), ("model", build_model(model_config))])
 
 
-def make_baseline_outputs(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_baselines(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     predictions = modeling[["date", "tag", "tag_type", "count", TARGET_COLUMN, "split"]].copy()
     predictions["baseline_last_value"] = modeling["count"].astype(float)
     predictions["baseline_rolling_mean_3"] = modeling["rolling_mean_3"].astype(float)
@@ -316,7 +304,7 @@ def train_model_worker(
 ) -> dict[str, Any]:
     model_name = model_config["name"]
     feature_cols = numeric_feature_names + CATEGORICAL_FEATURES
-    pipeline = make_pipeline(model_config, numeric_feature_names)
+    pipeline = build_pipeline(model_config, numeric_feature_names)
 
     start = time.perf_counter()
     pipeline.fit(train_frame[feature_cols], train_frame[TARGET_COLUMN])
@@ -503,7 +491,8 @@ def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> 
 
 def main() -> int:
     args = parse_args()
-    args.run_label = validate_run_label(args.run_label)
+    if args.run_label and not re.fullmatch(r"[A-Za-z0-9_]+", args.run_label):
+        raise ValueError("--run-label may contain only letters, numbers, and underscores.")
     paths = output_paths(args.run_label)
 
     print("Loading features")
@@ -527,7 +516,7 @@ def main() -> int:
         return 0
 
     print("Scoring baselines")
-    baseline_outputs = make_baseline_outputs(modeling)
+    baseline_outputs = run_baselines(modeling)
     baseline_predictions, baseline_metrics, _, _ = baseline_outputs
 
     print("Training Ray models")

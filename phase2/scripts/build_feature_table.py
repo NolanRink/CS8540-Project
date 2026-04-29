@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 SPARK_OUTPUT_DIR = PHASE2_ROOT / "data" / "spark_output" / "output"
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
-FEATURE_TABLE = PHASE2_ROOT / "data" / "derived" / "top_tags_daily_features.parquet"
+FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features.parquet"
 SENTIMENT_FEATURES = DERIVED_DIR / "daily_tag_sentiment.parquet"
 SENTIMENT_FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features_with_sentiment.parquet"
 
