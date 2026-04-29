@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ RAY_MODEL_METRICS_OVERALL = DERIVED_DIR / "ray_model_metrics_overall.csv"
 RAY_MODEL_METRICS_BY_TAG = DERIVED_DIR / "ray_model_metrics_by_tag.csv"
 RAY_MODEL_METRICS_BY_TAG_TYPE = DERIVED_DIR / "ray_model_metrics_by_tag_type.csv"
 RAY_MODEL_RUN_SUMMARY = DERIVED_DIR / "ray_model_run_summary.json"
+RAY_MODEL_TRAINING_TIMES = DERIVED_DIR / "ray_model_training_times.csv"
 FORECAST_COMPARISON = DERIVED_DIR / "sentiment_forecast_comparison.csv"
 
 TARGET_COLUMN = "target_next_count"
@@ -72,7 +74,6 @@ SENTIMENT_NUMERIC_FEATURES = [
     "positive_share_rolling_3",
     "negative_share_rolling_3",
 ]
-NUMERIC_FEATURES = BASE_NUMERIC_FEATURES
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
 EXPECTED_SPLITS = {"train": 1440, "validation": 330, "test": 300}
 OFFICIAL_BASELINE = "baseline_last_value"
@@ -138,13 +139,8 @@ def output_paths(run_label: str | None) -> dict[str, Path]:
         "ray_metrics_by_tag": labeled_path(RAY_MODEL_METRICS_BY_TAG, run_label),
         "ray_metrics_by_tag_type": labeled_path(RAY_MODEL_METRICS_BY_TAG_TYPE, run_label),
         "run_summary": labeled_path(RAY_MODEL_RUN_SUMMARY, run_label),
+        "training_times": labeled_path(RAY_MODEL_TRAINING_TIMES, run_label),
     }
-
-
-def numeric_features(include_sentiment: bool) -> list[str]:
-    if include_sentiment:
-        return [*BASE_NUMERIC_FEATURES, *SENTIMENT_NUMERIC_FEATURES]
-    return BASE_NUMERIC_FEATURES.copy()
 
 
 def require_columns(frame: pd.DataFrame, columns: list[str], label: str) -> None:
@@ -177,7 +173,9 @@ def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
     features = pd.read_parquet(feature_path)
-    selected_numeric = numeric_features(include_sentiment)
+    selected_numeric = BASE_NUMERIC_FEATURES.copy()
+    if include_sentiment:
+        selected_numeric += SENTIMENT_NUMERIC_FEATURES
     required = [
         "date",
         "tag",
@@ -319,7 +317,10 @@ def train_model_worker(
     model_name = model_config["name"]
     feature_cols = numeric_feature_names + CATEGORICAL_FEATURES
     pipeline = make_pipeline(model_config, numeric_feature_names)
+
+    start = time.perf_counter()
     pipeline.fit(train_frame[feature_cols], train_frame[TARGET_COLUMN])
+    train_seconds = time.perf_counter() - start
 
     prediction_frames = []
     metric_rows = []
@@ -333,6 +334,7 @@ def train_model_worker(
 
     return {
         "model": model_name,
+        "train_seconds": train_seconds,
         "metrics": metric_rows,
         "predictions": pd.concat(prediction_frames, ignore_index=True),
     }
@@ -377,7 +379,7 @@ def run_ray_models(
     num_cpus: int | None,
     use_gpu: bool,
     reserve_gpu_resource: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     train = modeling[modeling["split"] == "train"].copy()
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
@@ -400,7 +402,10 @@ def run_ray_models(
 
     metrics = pd.DataFrame([row for result in results for row in result["metrics"]])
     predictions = pd.concat([result["predictions"] for result in results], ignore_index=True)
-    return predictions, metrics
+    training_times = pd.DataFrame(
+        [{"model": result["model"], "train_seconds": result["train_seconds"]} for result in results]
+    )
+    return predictions, metrics, training_times
 
 
 def add_baseline_to_comparison(
@@ -456,6 +461,7 @@ def save_outputs(
     metrics: pd.DataFrame,
     by_tag: pd.DataFrame,
     by_tag_type: pd.DataFrame,
+    training_times: pd.DataFrame,
     run_summary: dict[str, Any],
     baseline_outputs: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
     paths: dict[str, Path],
@@ -472,12 +478,9 @@ def save_outputs(
     metrics.to_csv(paths["ray_metrics_overall"], index=False)
     by_tag.to_csv(paths["ray_metrics_by_tag"], index=False)
     by_tag_type.to_csv(paths["ray_metrics_by_tag_type"], index=False)
+    training_times.to_csv(paths["training_times"], index=False)
     with open(paths["run_summary"], "w", encoding="utf-8") as handle:
         json.dump(run_summary, handle, indent=2, default=str)
-
-    for path in paths.values():
-        if not path.exists():
-            raise FileNotFoundError(f"Expected output was not saved: {path}")
 
 
 def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> None:
@@ -496,8 +499,6 @@ def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> 
 
     comparison = comparison.sort_values(["run_label", "split", "sMAPE", "MAE"])
     comparison.to_csv(FORECAST_COMPARISON, index=False)
-    if not FORECAST_COMPARISON.exists():
-        raise FileNotFoundError(f"Comparison output was not saved: {FORECAST_COMPARISON}")
 
 
 def main() -> int:
@@ -530,7 +531,7 @@ def main() -> int:
     baseline_predictions, baseline_metrics, _, _ = baseline_outputs
 
     print("Training Ray models")
-    learned_predictions, learned_metrics = run_ray_models(
+    learned_predictions, learned_metrics, training_times = run_ray_models(
         modeling,
         selected_numeric,
         args.num_workers,
@@ -557,40 +558,41 @@ def main() -> int:
 
     by_tag = summarize_by_tag(all_predictions, best_model)
     by_tag_type = summarize_by_tag_type(all_predictions)
+    training_times = training_times.copy()
+    training_times.insert(0, "run_label", args.run_label or "default")
+    training_times["feature_set"] = "count_plus_sentiment" if args.include_sentiment else "count_only"
+    training_times["rows_train"] = int((modeling["split"] == "train").sum())
+    training_times["num_numeric_features"] = len(selected_numeric)
 
     expected_prediction_rows = (330 + 300) * (len(MODEL_CONFIGS) + 1)
     if len(all_predictions) != expected_prediction_rows:
         raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
 
     run_summary = {
-        "script": "phase2/scripts/run_ray_forecasting.py",
         "run_label": args.run_label,
         "features": str(args.features),
         "include_sentiment": bool(args.include_sentiment),
         "official_baseline": OFFICIAL_BASELINE,
-        "model_selection_metric": "validation sMAPE",
         "best_learned_model": best_model,
         "best_learned_validation_metrics": best_validation,
         "best_learned_test_metrics": best_test,
         "baseline_validation_metrics": baseline_validation,
         "baseline_test_metrics": baseline_test,
-        "best_learned_beats_baseline_validation_sMAPE": bool(best_validation["sMAPE"] < baseline_validation["sMAPE"]),
-        "best_learned_beats_baseline_test_sMAPE": bool(best_test["sMAPE"] < baseline_test["sMAPE"]),
-        "gpu_requested": bool(args.use_gpu),
-        "gpu_note": "Sklearn model families are CPU-bound; GPU handling is Ray resource compatibility only.",
-        "numeric_features": selected_numeric,
-        "categorical_features": CATEGORICAL_FEATURES,
         "models_compared": learned_names,
+        "model_training_seconds": {
+            row["model"]: float(row["train_seconds"]) for _, row in training_times.iterrows()
+        },
     }
 
     print("Saving results")
-    save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs, paths)
+    save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, training_times, run_summary, baseline_outputs, paths)
     update_forecast_comparison(all_metrics, args.run_label)
 
     print(f"Best learned model: {best_model}")
     print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}; test sMAPE: {best_test['sMAPE']:.4f}")
     print(f"Saved predictions to {paths['ray_predictions']}")
     print(f"Saved metrics to {paths['ray_metrics_overall']}")
+    print(f"Saved training times to {paths['training_times']}")
     if args.run_label is not None:
         print(f"Updated comparison CSV at {FORECAST_COMPARISON}")
     return 0

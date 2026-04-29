@@ -27,28 +27,23 @@ END_DATE = "2020-07-16"
 DEFAULT_MODEL = "StephanAkkerman/FinTwitBERT-sentiment"
 DEFAULT_HF_CACHE_DIR = Path(os.environ.get("HF_HOME", "/mnt/project/cache/hf"))
 REQUIRED_TWEET_COLUMNS = ["date", "text", "hashtags", "cashtags"]
+PROGRESS_EVERY = 500
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build tweet and daily tag sentiment features.")
     parser.add_argument("--input", type=Path, default=CLEANED_TWEETS)
     parser.add_argument("--selected-tags", type=Path, default=SELECTED_TAG_FEATURES)
-    parser.add_argument("--tweet-output", type=Path, default=TWEET_OUTPUT)
-    parser.add_argument("--daily-output", type=Path, default=DAILY_OUTPUT)
     parser.add_argument("--model-name", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-rows", type=int, default=None, help="Optional small-row smoke test limit after date filtering.")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_HF_CACHE_DIR)
-    parser.add_argument("--progress-every", type=int, default=500, help="Print progress every N batches; use 0 to disable.")
+    parser.add_argument("--tweet-output", type=Path, default=TWEET_OUTPUT, help=argparse.SUPPRESS)
+    parser.add_argument("--daily-output", type=Path, default=DAILY_OUTPUT, help=argparse.SUPPRESS)
+    parser.add_argument("--max-length", type=int, default=128, help=argparse.SUPPRESS)
+    parser.add_argument("--progress-every", type=int, default=PROGRESS_EVERY, help=argparse.SUPPRESS)
     return parser.parse_args()
-
-
-def require_columns(columns: list[str], required: list[str], label: str) -> None:
-    missing = [col for col in required if col not in columns]
-    if missing:
-        raise ValueError(f"{label} is missing columns: {missing}")
 
 
 def normalize_list(value) -> list[str]:
@@ -80,7 +75,9 @@ def load_cleaned_tweets(path: Path, max_rows: int | None) -> pd.DataFrame:
         raise FileNotFoundError(f"Missing cleaned tweets parquet: {path}")
 
     table = pq.read_table(path, columns=REQUIRED_TWEET_COLUMNS)
-    require_columns(table.column_names, REQUIRED_TWEET_COLUMNS, "cleaned tweets")
+    missing = [col for col in REQUIRED_TWEET_COLUMNS if col not in table.column_names]
+    if missing:
+        raise ValueError(f"cleaned tweets is missing columns: {missing}")
 
     raw_days = pd.Series(table["date"].cast(pa.int32()).combine_chunks().to_pylist(), dtype="float64")
     data = table.select(["text", "hashtags", "cashtags"]).to_pandas()
@@ -114,7 +111,9 @@ def load_selected_tags(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Missing selected tag feature table: {path}")
 
     selected = pd.read_parquet(path, columns=["tag", "tag_type"])
-    require_columns(list(selected.columns), ["tag", "tag_type"], "selected tag feature table")
+    missing = [col for col in ["tag", "tag_type"] if col not in selected.columns]
+    if missing:
+        raise ValueError(f"selected tag feature table is missing columns: {missing}")
     selected = selected[["tag", "tag_type"]].drop_duplicates().copy()
     selected["tag"] = np.where(
         selected["tag_type"].eq("cashtag"),
@@ -335,11 +334,6 @@ def save_outputs(tweet_sentiment: pd.DataFrame, daily_sentiment: pd.DataFrame, a
 
     tweet_sentiment.to_parquet(args.tweet_output, index=False)
     daily_sentiment.to_parquet(args.daily_output, index=False)
-
-    if not args.tweet_output.exists():
-        raise FileNotFoundError(f"Tweet sentiment output was not saved: {args.tweet_output}")
-    if not args.daily_output.exists():
-        raise FileNotFoundError(f"Daily sentiment output was not saved: {args.daily_output}")
 
 
 def main() -> int:

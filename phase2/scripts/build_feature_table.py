@@ -211,7 +211,7 @@ def add_sentiment_features(features: pd.DataFrame, sentiment: pd.DataFrame) -> p
     return merged
 
 
-def add_split_flags(features: pd.DataFrame) -> pd.DataFrame:
+def add_splits(features: pd.DataFrame) -> pd.DataFrame:
     dates = pd.DataFrame({"date": sorted(features["date"].dropna().unique())}).reset_index(names="date_position")
     dates["split"] = np.select(
         [
@@ -242,10 +242,14 @@ def add_split_flags(features: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def validate_feature_table(features: pd.DataFrame) -> None:
+def validate_feature_table(features: pd.DataFrame, include_sentiment: bool = False) -> None:
     tag_counts = features[["tag_type", "tag"]].drop_duplicates().groupby("tag_type").size().to_dict()
     split_counts = features.loc[features["modeling_ready"], "split"].value_counts().to_dict()
     expected_target = features.groupby(["tag_type", "tag"], sort=False)["count"].shift(-1)
+    if include_sentiment:
+        missing = [col for col in [*SENTIMENT_COLUMNS, *SENTIMENT_DERIVED_COLUMNS] if col not in features.columns]
+        if missing:
+            raise ValueError(f"Sentiment-enhanced feature table is missing columns: {missing}")
 
     if tag_counts != {"hashtag": 15, "cashtag": 15}:
         raise ValueError(f"Unexpected selected tag counts: {tag_counts}")
@@ -257,13 +261,6 @@ def validate_feature_table(features: pd.DataFrame) -> None:
         raise ValueError("Unexpected target_next_count values.")
     if split_counts != {"train": 1440, "validation": 330, "test": 300}:
         raise ValueError(f"Unexpected modeling-ready split counts: {split_counts}")
-
-
-def validate_sentiment_feature_table(features: pd.DataFrame) -> None:
-    missing = [col for col in [*SENTIMENT_COLUMNS, *SENTIMENT_DERIVED_COLUMNS] if col not in features.columns]
-    if missing:
-        raise ValueError(f"Sentiment-enhanced feature table is missing columns: {missing}")
-    validate_feature_table(features)
 
 
 def main() -> int:
@@ -281,16 +278,11 @@ def main() -> int:
         sentiment = load_sentiment_features(args.sentiment_features)
         features = add_sentiment_features(features, sentiment)
 
-    features = add_split_flags(features)
-    if args.include_sentiment:
-        validate_sentiment_feature_table(features)
-    else:
-        validate_feature_table(features)
+    features = add_splits(features)
+    validate_feature_table(features, include_sentiment=args.include_sentiment)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     features.to_parquet(args.output, index=False)
-    if not args.output.exists():
-        raise FileNotFoundError(f"Feature table was not saved: {args.output}")
 
     print(f"Saved {args.output}")
     print(f"Rows: {len(features):,}; modeling-ready rows: {int(features['modeling_ready'].sum()):,}")
