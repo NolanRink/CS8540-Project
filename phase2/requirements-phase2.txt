@@ -1,0 +1,8 @@
+pyspark
+ray
+pandas
+numpy
+matplotlib
+scikit-learn
+torch
+transformers
