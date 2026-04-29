@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -36,9 +37,10 @@ RAY_MODEL_METRICS_OVERALL = DERIVED_DIR / "ray_model_metrics_overall.csv"
 RAY_MODEL_METRICS_BY_TAG = DERIVED_DIR / "ray_model_metrics_by_tag.csv"
 RAY_MODEL_METRICS_BY_TAG_TYPE = DERIVED_DIR / "ray_model_metrics_by_tag_type.csv"
 RAY_MODEL_RUN_SUMMARY = DERIVED_DIR / "ray_model_run_summary.json"
+FORECAST_COMPARISON = DERIVED_DIR / "sentiment_forecast_comparison.csv"
 
 TARGET_COLUMN = "target_next_count"
-NUMERIC_FEATURES = [
+BASE_NUMERIC_FEATURES = [
     "count",
     "count_lag_1",
     "count_lag_2",
@@ -51,6 +53,26 @@ NUMERIC_FEATURES = [
     "count_diff_1",
     "count_pct_change_1",
 ]
+SENTIMENT_NUMERIC_FEATURES = [
+    "sentiment_mean",
+    "sentiment_median",
+    "sentiment_std",
+    "sentiment_tweet_count",
+    "positive_share",
+    "negative_share",
+    "neutral_share",
+    "avg_sentiment_confidence",
+    "sentiment_mean_lag_1",
+    "sentiment_mean_lag_3",
+    "sentiment_tweet_count_lag_1",
+    "positive_share_lag_1",
+    "negative_share_lag_1",
+    "sentiment_mean_rolling_3",
+    "sentiment_mean_rolling_7",
+    "positive_share_rolling_3",
+    "negative_share_rolling_3",
+]
+NUMERIC_FEATURES = BASE_NUMERIC_FEATURES
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
 EXPECTED_SPLITS = {"train": 1440, "validation": 330, "test": 300}
 OFFICIAL_BASELINE = "baseline_last_value"
@@ -81,12 +103,48 @@ MODEL_CONFIGS: list[dict[str, Any]] = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Phase 2 Ray forecasting.")
     parser.add_argument("--features", type=Path, default=FEATURE_TABLE)
+    parser.add_argument("--run-label", default=None, help="Optional label used to save run-specific outputs.")
+    parser.add_argument("--include-sentiment", action="store_true", help="Use sentiment numeric features if present.")
     parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
     parser.add_argument("--num-cpus", type=int, default=None)
     parser.add_argument("--smoke-test", action="store_true", help="Check data loading and Ray startup without training.")
     parser.add_argument("--use-gpu", action="store_true", help="Note GPU visibility; sklearn models still run on CPU.")
     parser.add_argument("--reserve-gpu-resource", action="store_true", help="Reserve Ray GPU resources for tasks if present.")
     return parser.parse_args()
+
+
+def validate_run_label(run_label: str | None) -> str | None:
+    if run_label is None:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_]+", run_label):
+        raise ValueError("--run-label may contain only letters, numbers, and underscores.")
+    return run_label
+
+
+def labeled_path(path: Path, run_label: str | None) -> Path:
+    if run_label is None:
+        return path
+    return path.with_name(f"{path.stem}_{run_label}{path.suffix}")
+
+
+def output_paths(run_label: str | None) -> dict[str, Path]:
+    return {
+        "baseline_predictions": labeled_path(BASELINE_PREDICTIONS, run_label),
+        "baseline_metrics_overall": labeled_path(BASELINE_METRICS_OVERALL, run_label),
+        "baseline_metrics_by_tag": labeled_path(BASELINE_METRICS_BY_TAG, run_label),
+        "baseline_metrics_by_tag_type": labeled_path(BASELINE_METRICS_BY_TAG_TYPE, run_label),
+        "ray_predictions": labeled_path(RAY_MODEL_PREDICTIONS, run_label),
+        "ray_metrics_overall": labeled_path(RAY_MODEL_METRICS_OVERALL, run_label),
+        "ray_metrics_by_tag": labeled_path(RAY_MODEL_METRICS_BY_TAG, run_label),
+        "ray_metrics_by_tag_type": labeled_path(RAY_MODEL_METRICS_BY_TAG_TYPE, run_label),
+        "run_summary": labeled_path(RAY_MODEL_RUN_SUMMARY, run_label),
+    }
+
+
+def numeric_features(include_sentiment: bool) -> list[str]:
+    if include_sentiment:
+        return [*BASE_NUMERIC_FEATURES, *SENTIMENT_NUMERIC_FEATURES]
+    return BASE_NUMERIC_FEATURES.copy()
 
 
 def require_columns(frame: pd.DataFrame, columns: list[str], label: str) -> None:
@@ -114,11 +172,12 @@ def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str
     }
 
 
-def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
+def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd.DataFrame, list[str]]:
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
     features = pd.read_parquet(feature_path)
+    selected_numeric = numeric_features(include_sentiment)
     required = [
         "date",
         "tag",
@@ -127,7 +186,7 @@ def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
         TARGET_COLUMN,
         "split",
         "modeling_ready",
-        *NUMERIC_FEATURES,
+        *selected_numeric,
         *CATEGORICAL_FEATURES,
     ]
     require_columns(features, required, "feature table")
@@ -141,7 +200,7 @@ def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
     split_counts = modeling["split"].value_counts().to_dict()
     if split_counts != EXPECTED_SPLITS:
         raise ValueError(f"Unexpected modeling split counts: {split_counts}")
-    return modeling
+    return modeling, selected_numeric
 
 
 def make_encoder() -> OneHotEncoder:
@@ -176,13 +235,13 @@ def make_model(config: dict[str, Any]):
     raise ValueError(f"Unknown model kind: {kind}")
 
 
-def make_pipeline(model_config: dict[str, Any]) -> Pipeline:
+def make_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str]) -> Pipeline:
     preprocessor = ColumnTransformer(
         [
             (
                 "numeric",
                 Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]),
-                NUMERIC_FEATURES,
+                numeric_feature_names,
             ),
             (
                 "categorical",
@@ -252,13 +311,14 @@ def make_baseline_outputs(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
 @ray.remote
 def train_model_worker(
     model_config: dict[str, Any],
+    numeric_feature_names: list[str],
     train_frame: pd.DataFrame,
     validation_frame: pd.DataFrame,
     test_frame: pd.DataFrame,
 ) -> dict[str, Any]:
     model_name = model_config["name"]
-    feature_cols = NUMERIC_FEATURES + CATEGORICAL_FEATURES
-    pipeline = make_pipeline(model_config)
+    feature_cols = numeric_feature_names + CATEGORICAL_FEATURES
+    pipeline = make_pipeline(model_config, numeric_feature_names)
     pipeline.fit(train_frame[feature_cols], train_frame[TARGET_COLUMN])
 
     prediction_frames = []
@@ -312,6 +372,7 @@ def start_ray(num_workers: int, num_cpus: int | None, use_gpu: bool, reserve_gpu
 
 def run_ray_models(
     modeling: pd.DataFrame,
+    numeric_feature_names: list[str],
     num_workers: int,
     num_cpus: int | None,
     use_gpu: bool,
@@ -326,6 +387,7 @@ def run_ray_models(
         futures = [
             train_model_worker.options(num_cpus=cpus_per_worker, num_gpus=gpus_per_worker).remote(
                 model_config,
+                numeric_feature_names,
                 train,
                 validation,
                 test,
@@ -396,30 +458,65 @@ def save_outputs(
     by_tag_type: pd.DataFrame,
     run_summary: dict[str, Any],
     baseline_outputs: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    paths: dict[str, Path],
 ) -> None:
     DERIVED_DIR.mkdir(parents=True, exist_ok=True)
     baseline_predictions, baseline_metrics, baseline_by_tag, baseline_by_type = baseline_outputs
 
-    baseline_predictions.to_parquet(BASELINE_PREDICTIONS, index=False)
-    baseline_metrics.to_csv(BASELINE_METRICS_OVERALL, index=False)
-    baseline_by_tag.to_csv(BASELINE_METRICS_BY_TAG, index=False)
-    baseline_by_type.to_csv(BASELINE_METRICS_BY_TAG_TYPE, index=False)
+    baseline_predictions.to_parquet(paths["baseline_predictions"], index=False)
+    baseline_metrics.to_csv(paths["baseline_metrics_overall"], index=False)
+    baseline_by_tag.to_csv(paths["baseline_metrics_by_tag"], index=False)
+    baseline_by_type.to_csv(paths["baseline_metrics_by_tag_type"], index=False)
 
-    predictions.to_parquet(RAY_MODEL_PREDICTIONS, index=False)
-    metrics.to_csv(RAY_MODEL_METRICS_OVERALL, index=False)
-    by_tag.to_csv(RAY_MODEL_METRICS_BY_TAG, index=False)
-    by_tag_type.to_csv(RAY_MODEL_METRICS_BY_TAG_TYPE, index=False)
-    with open(RAY_MODEL_RUN_SUMMARY, "w", encoding="utf-8") as handle:
+    predictions.to_parquet(paths["ray_predictions"], index=False)
+    metrics.to_csv(paths["ray_metrics_overall"], index=False)
+    by_tag.to_csv(paths["ray_metrics_by_tag"], index=False)
+    by_tag_type.to_csv(paths["ray_metrics_by_tag_type"], index=False)
+    with open(paths["run_summary"], "w", encoding="utf-8") as handle:
         json.dump(run_summary, handle, indent=2, default=str)
+
+    for path in paths.values():
+        if not path.exists():
+            raise FileNotFoundError(f"Expected output was not saved: {path}")
+
+
+def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> None:
+    if run_label is None:
+        return
+
+    rows = metrics[["split", "model", "rows", "MAE", "RMSE", "sMAPE"]].copy()
+    rows.insert(0, "run_label", run_label)
+
+    if FORECAST_COMPARISON.exists():
+        comparison = pd.read_csv(FORECAST_COMPARISON)
+        comparison = comparison[comparison["run_label"] != run_label]
+        comparison = pd.concat([comparison, rows], ignore_index=True)
+    else:
+        comparison = rows
+
+    comparison = comparison.sort_values(["run_label", "split", "sMAPE", "MAE"])
+    comparison.to_csv(FORECAST_COMPARISON, index=False)
+    if not FORECAST_COMPARISON.exists():
+        raise FileNotFoundError(f"Comparison output was not saved: {FORECAST_COMPARISON}")
 
 
 def main() -> int:
     args = parse_args()
+    args.run_label = validate_run_label(args.run_label)
+    paths = output_paths(args.run_label)
 
     print("Loading feature table...")
-    modeling = load_modeling_frame(args.features)
+    modeling, selected_numeric = load_modeling_frame(args.features, args.include_sentiment)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
     print(f"Modeling rows by split: {split_counts}")
+    print(f"Numeric features: {len(selected_numeric)}")
+    if args.include_sentiment:
+        covered = int((modeling["sentiment_tweet_count"] > 0).sum())
+        if covered / len(modeling) < 0.05:
+            print(
+                "Warning: sentiment coverage is low "
+                f"({covered:,}/{len(modeling):,} modeling rows). Treat results as pipeline validation only."
+            )
 
     if args.smoke_test:
         print("Starting Ray smoke test...")
@@ -435,6 +532,7 @@ def main() -> int:
     print("Training Ray models...")
     learned_predictions, learned_metrics = run_ray_models(
         modeling,
+        selected_numeric,
         args.num_workers,
         args.num_cpus,
         args.use_gpu,
@@ -466,6 +564,9 @@ def main() -> int:
 
     run_summary = {
         "script": "phase2/scripts/run_ray_forecasting.py",
+        "run_label": args.run_label,
+        "features": str(args.features),
+        "include_sentiment": bool(args.include_sentiment),
         "official_baseline": OFFICIAL_BASELINE,
         "model_selection_metric": "validation sMAPE",
         "best_learned_model": best_model,
@@ -477,18 +578,21 @@ def main() -> int:
         "best_learned_beats_baseline_test_sMAPE": bool(best_test["sMAPE"] < baseline_test["sMAPE"]),
         "gpu_requested": bool(args.use_gpu),
         "gpu_note": "Sklearn model families are CPU-bound; GPU handling is Ray resource compatibility only.",
-        "numeric_features": NUMERIC_FEATURES,
+        "numeric_features": selected_numeric,
         "categorical_features": CATEGORICAL_FEATURES,
         "models_compared": learned_names,
     }
 
     print("Saving outputs...")
-    save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs)
+    save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs, paths)
+    update_forecast_comparison(all_metrics, args.run_label)
 
     print(f"Best learned model: {best_model}")
     print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}; test sMAPE: {best_test['sMAPE']:.4f}")
-    print(f"Saved predictions to {RAY_MODEL_PREDICTIONS}")
-    print(f"Saved metrics to {RAY_MODEL_METRICS_OVERALL}")
+    print(f"Saved predictions to {paths['ray_predictions']}")
+    print(f"Saved metrics to {paths['ray_metrics_overall']}")
+    if args.run_label is not None:
+        print(f"Updated comparison CSV at {FORECAST_COMPARISON}")
     return 0
 
 
