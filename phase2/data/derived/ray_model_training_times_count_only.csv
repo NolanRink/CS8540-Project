@@ -1,0 +1,5 @@
+run_label,model,train_seconds,feature_set,rows_train,num_numeric_features
+count_only,linear_regression_pooled,0.013083072990411893,count_only,1440,11
+count_only,ridge_regression_pooled,0.012323185976129025,count_only,1440,11
+count_only,random_forest_pooled,0.6717150309996214,count_only,1440,11
+count_only,hist_gradient_boosting_pooled,0.19595848399330862,count_only,1440,11

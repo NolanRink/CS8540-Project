@@ -1,0 +1,5 @@
+run_label,model,train_seconds,feature_set,rows_train,num_numeric_features
+count_plus_sentiment,linear_regression_pooled,0.015996744012227282,count_plus_sentiment,1440,28
+count_plus_sentiment,ridge_regression_pooled,0.014165244996547699,count_plus_sentiment,1440,28
+count_plus_sentiment,random_forest_pooled,1.6446017829875927,count_plus_sentiment,1440,28
+count_plus_sentiment,hist_gradient_boosting_pooled,0.3629075819917489,count_plus_sentiment,1440,28

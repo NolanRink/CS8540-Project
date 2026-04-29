@@ -1,0 +1,51 @@
+{
+  "run_label": "count_plus_sentiment",
+  "features": "phase2/data/derived/top_tags_daily_features_with_sentiment.parquet",
+  "include_sentiment": true,
+  "official_baseline": "baseline_last_value",
+  "best_learned_model": "hist_gradient_boosting_pooled",
+  "best_learned_validation_metrics": {
+    "split": "validation",
+    "model": "hist_gradient_boosting_pooled",
+    "rows": 330,
+    "MAE": 123.59380536539538,
+    "RMSE": 229.0009802476971,
+    "sMAPE": 38.38197545569021
+  },
+  "best_learned_test_metrics": {
+    "split": "test",
+    "model": "hist_gradient_boosting_pooled",
+    "rows": 300,
+    "MAE": 106.02342039758459,
+    "RMSE": 177.1962688154291,
+    "sMAPE": 25.426823436768505
+  },
+  "baseline_validation_metrics": {
+    "split": "validation",
+    "model": "baseline_last_value",
+    "rows": 330,
+    "MAE": 147.64848484848486,
+    "RMSE": 278.857680655574,
+    "sMAPE": 44.9642694253447
+  },
+  "baseline_test_metrics": {
+    "split": "test",
+    "model": "baseline_last_value",
+    "rows": 300,
+    "MAE": 132.2,
+    "RMSE": 260.0800389623676,
+    "sMAPE": 30.433236474923834
+  },
+  "models_compared": [
+    "linear_regression_pooled",
+    "ridge_regression_pooled",
+    "random_forest_pooled",
+    "hist_gradient_boosting_pooled"
+  ],
+  "model_training_seconds": {
+    "linear_regression_pooled": 0.015996744012227282,
+    "ridge_regression_pooled": 0.014165244996547699,
+    "random_forest_pooled": 1.6446017829875927,
+    "hist_gradient_boosting_pooled": 0.3629075819917489
+  }
+}
