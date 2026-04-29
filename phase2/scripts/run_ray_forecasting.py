@@ -1,11 +1,14 @@
-"""Run Phase 2 baseline and Ray-based pooled forecasting models."""
+"""Run the Phase 2 baseline and Ray pooled forecasting comparison."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+import warnings
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,21 +21,71 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-import config
 
+PHASE2_ROOT = Path(__file__).resolve().parents[1]
+DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features.parquet"
 
-MODEL_NAMES = [
-    "linear_regression_pooled",
-    "ridge_regression_pooled",
-    "random_forest_pooled",
-    "hist_gradient_boosting_pooled",
+BASELINE_PREDICTIONS = DERIVED_DIR / "baseline_forecast_predictions.parquet"
+BASELINE_METRICS_OVERALL = DERIVED_DIR / "baseline_forecast_metrics_overall.csv"
+BASELINE_METRICS_BY_TAG = DERIVED_DIR / "baseline_forecast_metrics_by_tag.csv"
+BASELINE_METRICS_BY_TAG_TYPE = DERIVED_DIR / "baseline_forecast_metrics_by_tag_type.csv"
+
+RAY_MODEL_PREDICTIONS = DERIVED_DIR / "ray_model_predictions.parquet"
+RAY_MODEL_METRICS_OVERALL = DERIVED_DIR / "ray_model_metrics_overall.csv"
+RAY_MODEL_METRICS_BY_TAG = DERIVED_DIR / "ray_model_metrics_by_tag.csv"
+RAY_MODEL_METRICS_BY_TAG_TYPE = DERIVED_DIR / "ray_model_metrics_by_tag_type.csv"
+RAY_MODEL_RUN_SUMMARY = DERIVED_DIR / "ray_model_run_summary.json"
+
+TARGET_COLUMN = "target_next_count"
+NUMERIC_FEATURES = [
+    "count",
+    "count_lag_1",
+    "count_lag_2",
+    "count_lag_3",
+    "count_lag_7",
+    "rolling_mean_3",
+    "rolling_mean_7",
+    "rolling_std_3",
+    "rolling_std_7",
+    "count_diff_1",
+    "count_pct_change_1",
+]
+CATEGORICAL_FEATURES = ["tag", "tag_type"]
+EXPECTED_SPLITS = {"train": 1440, "validation": 330, "test": 300}
+OFFICIAL_BASELINE = "baseline_last_value"
+
+MODEL_CONFIGS: list[dict[str, Any]] = [
+    {"name": "linear_regression_pooled", "kind": "linear_regression"},
+    {"name": "ridge_regression_pooled", "kind": "ridge", "alpha": 10.0},
+    {
+        "name": "random_forest_pooled",
+        "kind": "random_forest",
+        "n_estimators": 80,
+        "max_depth": 8,
+        "min_samples_leaf": 5,
+        "random_state": 42,
+    },
+    {
+        "name": "hist_gradient_boosting_pooled",
+        "kind": "hist_gradient_boosting",
+        "max_iter": 120,
+        "learning_rate": 0.05,
+        "max_leaf_nodes": 15,
+        "l2_regularization": 0.1,
+        "random_state": 42,
+    },
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Phase 2 Ray forecasting comparison.")
-    parser.add_argument("--features", type=Path, default=config.FEATURE_TABLE)
-    parser.add_argument("--num-cpus", type=int, default=min(4, len(MODEL_NAMES)))
+    parser = argparse.ArgumentParser(description="Run Phase 2 Ray forecasting.")
+    parser.add_argument("--features", type=Path, default=FEATURE_TABLE)
+    parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
+    parser.add_argument("--num-cpus", type=int, default=None)
+    parser.add_argument("--smoke-test", action="store_true", help="Check data loading and Ray startup without training.")
+    parser.add_argument("--use-gpu", action="store_true", help="Note GPU visibility; sklearn models still run on CPU.")
+    parser.add_argument("--reserve-gpu-resource", action="store_true", help="Reserve Ray GPU resources for tasks if present.")
     return parser.parse_args()
 
 
@@ -42,7 +95,7 @@ def require_columns(frame: pd.DataFrame, columns: list[str], label: str) -> None
         raise ValueError(f"{label} is missing columns: {missing}")
 
 
-def smape_percent(actual, predicted) -> float:
+def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
     denominator = (np.abs(actual) + np.abs(predicted)) / 2
@@ -50,149 +103,234 @@ def smape_percent(actual, predicted) -> float:
     return float(np.mean(values))
 
 
-def metric_dict(actual, predicted) -> dict[str, float | int]:
-    actual = np.asarray(actual, dtype=float)
-    predicted = np.asarray(predicted, dtype=float)
+def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str, float | int]:
+    actual_values = np.asarray(actual, dtype=float)
+    predicted_values = np.asarray(predicted, dtype=float)
     return {
-        "rows": int(len(actual)),
-        "MAE": float(mean_absolute_error(actual, predicted)),
-        "RMSE": float(np.sqrt(mean_squared_error(actual, predicted))),
-        "sMAPE": smape_percent(actual, predicted),
+        "rows": int(len(actual_values)),
+        "MAE": float(mean_absolute_error(actual_values, predicted_values)),
+        "RMSE": float(np.sqrt(mean_squared_error(actual_values, predicted_values))),
+        "sMAPE": smape_percent(actual_values, predicted_values),
     }
 
 
-def metrics_by_baseline(predictions: pd.DataFrame, split_name: str) -> pd.DataFrame:
-    rows = []
-    split_frame = predictions[predictions["split"] == split_name]
-    baseline_cols = [
-        "baseline_last_value",
-        "baseline_rolling_mean_3",
-        "baseline_rolling_mean_7",
-        "baseline_lag_7",
+def load_modeling_frame(feature_path: Path) -> pd.DataFrame:
+    if not feature_path.exists():
+        raise FileNotFoundError(f"Missing feature table: {feature_path}")
+
+    features = pd.read_parquet(feature_path)
+    required = [
+        "date",
+        "tag",
+        "tag_type",
+        "count",
+        TARGET_COLUMN,
+        "split",
+        "modeling_ready",
+        *NUMERIC_FEATURES,
+        *CATEGORICAL_FEATURES,
     ]
-    for baseline in baseline_cols:
-        rows.append({"split": split_name, "baseline": baseline, **metric_dict(split_frame["target_next_count"], split_frame[baseline])})
-    return pd.DataFrame(rows)
+    require_columns(features, required, "feature table")
+
+    modeling = (
+        features.loc[features["modeling_ready"]]
+        .copy()
+        .sort_values(["tag_type", "tag", "date"])
+        .reset_index(drop=True)
+    )
+    split_counts = modeling["split"].value_counts().to_dict()
+    if split_counts != EXPECTED_SPLITS:
+        raise ValueError(f"Unexpected modeling split counts: {split_counts}")
+    return modeling
 
 
-def make_baseline_predictions(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    predictions = modeling[["date", "tag", "tag_type", "count", "target_next_count", "split"]].copy()
+def make_encoder() -> OneHotEncoder:
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
+def make_model(config: dict[str, Any]):
+    kind = config["kind"]
+    if kind == "linear_regression":
+        return LinearRegression()
+    if kind == "ridge":
+        return Ridge(alpha=config["alpha"])
+    if kind == "random_forest":
+        return RandomForestRegressor(
+            n_estimators=config["n_estimators"],
+            max_depth=config["max_depth"],
+            min_samples_leaf=config["min_samples_leaf"],
+            random_state=config["random_state"],
+            n_jobs=1,
+        )
+    if kind == "hist_gradient_boosting":
+        return HistGradientBoostingRegressor(
+            max_iter=config["max_iter"],
+            learning_rate=config["learning_rate"],
+            max_leaf_nodes=config["max_leaf_nodes"],
+            l2_regularization=config["l2_regularization"],
+            random_state=config["random_state"],
+        )
+    raise ValueError(f"Unknown model kind: {kind}")
+
+
+def make_pipeline(model_config: dict[str, Any]) -> Pipeline:
+    preprocessor = ColumnTransformer(
+        [
+            (
+                "numeric",
+                Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]),
+                NUMERIC_FEATURES,
+            ),
+            (
+                "categorical",
+                Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", make_encoder())]),
+                CATEGORICAL_FEATURES,
+            ),
+        ]
+    )
+    return Pipeline([("preprocess", preprocessor), ("model", make_model(model_config))])
+
+
+def make_baseline_outputs(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    predictions = modeling[["date", "tag", "tag_type", "count", TARGET_COLUMN, "split"]].copy()
     predictions["baseline_last_value"] = modeling["count"].astype(float)
     predictions["baseline_rolling_mean_3"] = modeling["rolling_mean_3"].astype(float)
     predictions["baseline_rolling_mean_7"] = modeling["rolling_mean_7"].astype(float)
     predictions["baseline_lag_7"] = modeling["count_lag_7"].astype(float)
 
-    overall = pd.concat(
-        [metrics_by_baseline(predictions, "validation"), metrics_by_baseline(predictions, "test")],
-        ignore_index=True,
-    ).sort_values(["split", "MAE", "sMAPE"])
+    baseline_names = [
+        "baseline_last_value",
+        "baseline_rolling_mean_3",
+        "baseline_rolling_mean_7",
+        "baseline_lag_7",
+    ]
 
-    best_baseline = overall[overall["split"] == "validation"].sort_values(["MAE", "sMAPE"]).iloc[0]["baseline"]
-    per_tag_rows = []
+    overall_rows = []
+    for split_name in ["validation", "test"]:
+        split_frame = predictions[predictions["split"] == split_name]
+        for baseline in baseline_names:
+            overall_rows.append(
+                {
+                    "split": split_name,
+                    "baseline": baseline,
+                    **metric_row(split_frame[TARGET_COLUMN], split_frame[baseline]),
+                }
+            )
+    overall = pd.DataFrame(overall_rows).sort_values(["split", "MAE", "sMAPE"])
+
+    by_tag_rows = []
     for (tag_type, tag), group in predictions[predictions["split"] == "test"].groupby(["tag_type", "tag"]):
-        per_tag_rows.append({"tag_type": tag_type, "tag": tag, "baseline": best_baseline, **metric_dict(group["target_next_count"], group[best_baseline])})
-    by_tag = pd.DataFrame(per_tag_rows).sort_values(["MAE", "sMAPE"], ascending=[False, False])
+        by_tag_rows.append(
+            {
+                "tag_type": tag_type,
+                "tag": tag,
+                "baseline": OFFICIAL_BASELINE,
+                **metric_row(group[TARGET_COLUMN], group[OFFICIAL_BASELINE]),
+            }
+        )
+    by_tag = pd.DataFrame(by_tag_rows).sort_values(["MAE", "sMAPE"], ascending=[False, False])
 
     by_type_rows = []
-    for (split_name, tag_type), group in predictions[predictions["split"].isin(["validation", "test"])].groupby(["split", "tag_type"]):
-        for baseline in ["baseline_last_value", "baseline_rolling_mean_3", "baseline_rolling_mean_7", "baseline_lag_7"]:
-            by_type_rows.append({"split": split_name, "tag_type": tag_type, "baseline": baseline, **metric_dict(group["target_next_count"], group[baseline])})
+    scored = predictions[predictions["split"].isin(["validation", "test"])]
+    for (split_name, tag_type), group in scored.groupby(["split", "tag_type"]):
+        for baseline in baseline_names:
+            by_type_rows.append(
+                {
+                    "split": split_name,
+                    "tag_type": tag_type,
+                    "baseline": baseline,
+                    **metric_row(group[TARGET_COLUMN], group[baseline]),
+                }
+            )
     by_tag_type = pd.DataFrame(by_type_rows).sort_values(["split", "tag_type", "MAE"])
     return predictions, overall, by_tag, by_tag_type
 
 
 @ray.remote
-def train_and_evaluate_model(model_name, train_frame, validation_frame, test_frame, numeric_features, categorical_features):
-    import numpy as _np
-    import pandas as _pd
-    from sklearn.compose import ColumnTransformer as _ColumnTransformer
-    from sklearn.ensemble import HistGradientBoostingRegressor as _HistGradientBoostingRegressor
-    from sklearn.ensemble import RandomForestRegressor as _RandomForestRegressor
-    from sklearn.impute import SimpleImputer as _SimpleImputer
-    from sklearn.linear_model import LinearRegression as _LinearRegression
-    from sklearn.linear_model import Ridge as _Ridge
-    from sklearn.metrics import mean_absolute_error as _mean_absolute_error
-    from sklearn.metrics import mean_squared_error as _mean_squared_error
-    from sklearn.pipeline import Pipeline as _Pipeline
-    from sklearn.preprocessing import OneHotEncoder as _OneHotEncoder
-    from sklearn.preprocessing import StandardScaler as _StandardScaler
+def train_model_worker(
+    model_config: dict[str, Any],
+    train_frame: pd.DataFrame,
+    validation_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+) -> dict[str, Any]:
+    model_name = model_config["name"]
+    feature_cols = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+    pipeline = make_pipeline(model_config)
+    pipeline.fit(train_frame[feature_cols], train_frame[TARGET_COLUMN])
 
-    def _smape(actual, predicted):
-        actual = _np.asarray(actual, dtype=float)
-        predicted = _np.asarray(predicted, dtype=float)
-        denominator = (_np.abs(actual) + _np.abs(predicted)) / 2
-        values = _np.where(denominator == 0, 0.0, _np.abs(predicted - actual) / denominator * 100)
-        return float(_np.mean(values))
-
-    def _metrics(actual, predicted):
-        actual = _np.asarray(actual, dtype=float)
-        predicted = _np.asarray(predicted, dtype=float)
-        return {
-            "rows": int(len(actual)),
-            "MAE": float(_mean_absolute_error(actual, predicted)),
-            "RMSE": float(_np.sqrt(_mean_squared_error(actual, predicted))),
-            "sMAPE": _smape(actual, predicted),
-        }
-
-    def _encoder():
-        try:
-            return _OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-        except TypeError:
-            return _OneHotEncoder(handle_unknown="ignore", sparse=False)
-
-    if model_name == "linear_regression_pooled":
-        model = _LinearRegression()
-    elif model_name == "ridge_regression_pooled":
-        model = _Ridge(alpha=10.0)
-    elif model_name == "random_forest_pooled":
-        model = _RandomForestRegressor(n_estimators=80, max_depth=8, min_samples_leaf=5, random_state=42, n_jobs=1)
-    elif model_name == "hist_gradient_boosting_pooled":
-        model = _HistGradientBoostingRegressor(max_iter=120, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=0.1, random_state=42)
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
-
-    preprocessor = _ColumnTransformer(
-        [
-            ("numeric", _Pipeline([("imputer", _SimpleImputer(strategy="median")), ("scaler", _StandardScaler())]), numeric_features),
-            ("categorical", _Pipeline([("imputer", _SimpleImputer(strategy="most_frequent")), ("onehot", _encoder())]), categorical_features),
-        ]
-    )
-    pipeline = _Pipeline([("preprocess", preprocessor), ("model", model)])
-    feature_cols = numeric_features + categorical_features
-    pipeline.fit(train_frame[feature_cols], train_frame["target_next_count"])
-
-    outputs = []
+    prediction_frames = []
     metric_rows = []
     for split_name, frame in [("validation", validation_frame), ("test", test_frame)]:
-        predicted = _np.clip(pipeline.predict(frame[feature_cols]), 0, None)
-        split_predictions = frame[["date", "tag", "tag_type", "target_next_count", "split"]].copy()
+        predicted = np.clip(pipeline.predict(frame[feature_cols]), 0, None)
+        split_predictions = frame[["date", "tag", "tag_type", TARGET_COLUMN, "split"]].copy()
         split_predictions["model"] = model_name
         split_predictions["prediction"] = predicted
-        outputs.append(split_predictions)
-        metric_rows.append({"split": split_name, "model": model_name, **_metrics(frame["target_next_count"], predicted)})
+        prediction_frames.append(split_predictions)
+        metric_rows.append({"split": split_name, "model": model_name, **metric_row(frame[TARGET_COLUMN], predicted)})
 
-    return {"model": model_name, "metrics": metric_rows, "predictions": _pd.concat(outputs, ignore_index=True)}
+    return {
+        "model": model_name,
+        "metrics": metric_rows,
+        "predictions": pd.concat(prediction_frames, ignore_index=True),
+    }
 
 
-def run_ray_models(modeling: pd.DataFrame, num_cpus: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+def start_ray(num_workers: int, num_cpus: int | None, use_gpu: bool, reserve_gpu_resource: bool) -> tuple[int, float]:
+    if num_workers < 1:
+        raise ValueError("--num-workers must be at least 1")
+    if num_cpus is not None and num_cpus < 1:
+        raise ValueError("--num-cpus must be at least 1")
+
+    total_cpus = num_cpus or max(1, num_workers)
+    if ray.is_initialized():
+        ray.shutdown()
+
+    warnings.filterwarnings("ignore", message="Tip: In future versions of Ray.*", category=FutureWarning)
+    ray.init(
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        log_to_driver=False,
+        logging_level=logging.ERROR,
+        num_cpus=total_cpus,
+    )
+    resources = ray.cluster_resources()
+    visible_gpus = float(resources.get("GPU", 0.0))
+
+    if use_gpu:
+        print(f"Ray sees {visible_gpus:g} GPU resource(s); sklearn models remain CPU-bound.")
+
+    gpus_per_worker = 0.0
+    if reserve_gpu_resource and visible_gpus > 0:
+        gpus_per_worker = min(1.0, visible_gpus / max(1, num_workers))
+
+    cpus_per_worker = max(1, total_cpus // max(1, num_workers))
+    return cpus_per_worker, gpus_per_worker
+
+
+def run_ray_models(
+    modeling: pd.DataFrame,
+    num_workers: int,
+    num_cpus: int | None,
+    use_gpu: bool,
+    reserve_gpu_resource: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     train = modeling[modeling["split"] == "train"].copy()
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
 
-    if ray.is_initialized():
-        ray.shutdown()
-    ray.init(ignore_reinit_error=True, include_dashboard=False, num_cpus=num_cpus, log_to_driver=False)
+    cpus_per_worker, gpus_per_worker = start_ray(num_workers, num_cpus, use_gpu, reserve_gpu_resource)
     try:
         futures = [
-            train_and_evaluate_model.remote(
-                model_name,
+            train_model_worker.options(num_cpus=cpus_per_worker, num_gpus=gpus_per_worker).remote(
+                model_config,
                 train,
                 validation,
                 test,
-                config.NUMERIC_FEATURES,
-                config.CATEGORICAL_FEATURES,
             )
-            for model_name in MODEL_NAMES
+            for model_config in MODEL_CONFIGS
         ]
         results = ray.get(futures)
     finally:
@@ -203,74 +341,132 @@ def run_ray_models(modeling: pd.DataFrame, num_cpus: int) -> tuple[pd.DataFrame,
     return predictions, metrics
 
 
+def add_baseline_to_comparison(
+    learned_predictions: pd.DataFrame,
+    learned_metrics: pd.DataFrame,
+    baseline_predictions: pd.DataFrame,
+    baseline_metrics: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    baseline_comparison = (
+        baseline_predictions[baseline_predictions["split"].isin(["validation", "test"])][
+            ["date", "tag", "tag_type", TARGET_COLUMN, "split", OFFICIAL_BASELINE]
+        ]
+        .rename(columns={OFFICIAL_BASELINE: "prediction"})
+        .copy()
+    )
+    baseline_comparison["model"] = OFFICIAL_BASELINE
+
+    all_predictions = pd.concat(
+        [
+            learned_predictions,
+            baseline_comparison[["date", "tag", "tag_type", TARGET_COLUMN, "split", "model", "prediction"]],
+        ],
+        ignore_index=True,
+    )
+
+    baseline_rows = baseline_metrics.rename(columns={"baseline": "model"})[
+        ["split", "model", "rows", "MAE", "RMSE", "sMAPE"]
+    ]
+    all_metrics = pd.concat(
+        [learned_metrics, baseline_rows[baseline_rows["model"] == OFFICIAL_BASELINE]],
+        ignore_index=True,
+    )
+    return all_predictions, all_metrics
+
+
 def summarize_by_tag(predictions: pd.DataFrame, best_model: str) -> pd.DataFrame:
     rows = []
-    for (tag_type, tag), group in predictions[(predictions["split"] == "test") & (predictions["model"] == best_model)].groupby(["tag_type", "tag"]):
-        rows.append({"tag_type": tag_type, "tag": tag, "model": best_model, **metric_dict(group["target_next_count"], group["prediction"])})
+    best_test = predictions[(predictions["split"] == "test") & (predictions["model"] == best_model)]
+    for (tag_type, tag), group in best_test.groupby(["tag_type", "tag"]):
+        rows.append({"tag_type": tag_type, "tag": tag, "model": best_model, **metric_row(group[TARGET_COLUMN], group["prediction"])})
     return pd.DataFrame(rows).sort_values(["MAE", "sMAPE"], ascending=[False, False])
 
 
 def summarize_by_tag_type(predictions: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (split_name, tag_type, model), group in predictions.groupby(["split", "tag_type", "model"]):
-        rows.append({"split": split_name, "tag_type": tag_type, "model": model, **metric_dict(group["target_next_count"], group["prediction"])})
+        rows.append({"split": split_name, "tag_type": tag_type, "model": model, **metric_row(group[TARGET_COLUMN], group["prediction"])})
     return pd.DataFrame(rows).sort_values(["split", "tag_type", "sMAPE", "MAE"])
+
+
+def save_outputs(
+    predictions: pd.DataFrame,
+    metrics: pd.DataFrame,
+    by_tag: pd.DataFrame,
+    by_tag_type: pd.DataFrame,
+    run_summary: dict[str, Any],
+    baseline_outputs: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> None:
+    DERIVED_DIR.mkdir(parents=True, exist_ok=True)
+    baseline_predictions, baseline_metrics, baseline_by_tag, baseline_by_type = baseline_outputs
+
+    baseline_predictions.to_parquet(BASELINE_PREDICTIONS, index=False)
+    baseline_metrics.to_csv(BASELINE_METRICS_OVERALL, index=False)
+    baseline_by_tag.to_csv(BASELINE_METRICS_BY_TAG, index=False)
+    baseline_by_type.to_csv(BASELINE_METRICS_BY_TAG_TYPE, index=False)
+
+    predictions.to_parquet(RAY_MODEL_PREDICTIONS, index=False)
+    metrics.to_csv(RAY_MODEL_METRICS_OVERALL, index=False)
+    by_tag.to_csv(RAY_MODEL_METRICS_BY_TAG, index=False)
+    by_tag_type.to_csv(RAY_MODEL_METRICS_BY_TAG_TYPE, index=False)
+    with open(RAY_MODEL_RUN_SUMMARY, "w", encoding="utf-8") as handle:
+        json.dump(run_summary, handle, indent=2, default=str)
 
 
 def main() -> int:
     args = parse_args()
-    if not args.features.exists():
-        raise FileNotFoundError(f"Missing feature table: {args.features}")
 
-    print("Running Phase 2 baseline and Ray forecasting comparison")
-    features = pd.read_parquet(args.features)
-    required = ["date", "tag", "tag_type", "count", "target_next_count", "split", "modeling_ready"] + config.NUMERIC_FEATURES + config.CATEGORICAL_FEATURES
-    require_columns(features, required, "feature table")
-    modeling = features[features["modeling_ready"]].sort_values(["tag_type", "tag", "date"]).reset_index(drop=True)
+    print("Loading feature table...")
+    modeling = load_modeling_frame(args.features)
+    split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
+    print(f"Modeling rows by split: {split_counts}")
 
-    split_counts = modeling["split"].value_counts().to_dict()
-    if split_counts != {"train": 1440, "validation": 330, "test": 300}:
-        raise ValueError(f"Unexpected modeling split counts: {split_counts}")
+    if args.smoke_test:
+        print("Starting Ray smoke test...")
+        start_ray(args.num_workers, args.num_cpus, args.use_gpu, args.reserve_gpu_resource)
+        ray.shutdown()
+        print("Smoke test passed.")
+        return 0
 
-    config.DERIVED_DIR.mkdir(parents=True, exist_ok=True)
-    baseline_predictions, baseline_metrics, baseline_by_tag, baseline_by_type = make_baseline_predictions(modeling)
-    baseline_predictions.to_parquet(config.BASELINE_PREDICTIONS, index=False)
-    baseline_metrics.to_csv(config.BASELINE_METRICS_OVERALL, index=False)
-    baseline_by_tag.to_csv(config.BASELINE_METRICS_BY_TAG, index=False)
-    baseline_by_type.to_csv(config.BASELINE_METRICS_BY_TAG_TYPE, index=False)
+    print("Building baseline metrics...")
+    baseline_outputs = make_baseline_outputs(modeling)
+    baseline_predictions, baseline_metrics, _, _ = baseline_outputs
 
-    learned_predictions, learned_metrics = run_ray_models(modeling, args.num_cpus)
-
-    baseline_for_comparison = baseline_predictions[baseline_predictions["split"].isin(["validation", "test"])][
-        ["date", "tag", "tag_type", "target_next_count", "split", "baseline_last_value"]
-    ].rename(columns={"baseline_last_value": "prediction"})
-    baseline_for_comparison["model"] = "baseline_last_value"
-
-    all_predictions = pd.concat(
-        [learned_predictions, baseline_for_comparison[["date", "tag", "tag_type", "target_next_count", "split", "model", "prediction"]]],
-        ignore_index=True,
+    print("Training Ray models...")
+    learned_predictions, learned_metrics = run_ray_models(
+        modeling,
+        args.num_workers,
+        args.num_cpus,
+        args.use_gpu,
+        args.reserve_gpu_resource,
     )
-    baseline_rows = baseline_metrics.rename(columns={"baseline": "model"})[["split", "model", "rows", "MAE", "RMSE", "sMAPE"]]
-    overall_metrics = pd.concat([learned_metrics, baseline_rows[baseline_rows["model"] == "baseline_last_value"]], ignore_index=True)
+    all_predictions, all_metrics = add_baseline_to_comparison(
+        learned_predictions,
+        learned_metrics,
+        baseline_predictions,
+        baseline_metrics,
+    )
 
-    validation_metrics = overall_metrics[overall_metrics["split"] == "validation"].sort_values(["sMAPE", "MAE"])
-    test_metrics = overall_metrics[overall_metrics["split"] == "test"].sort_values(["sMAPE", "MAE"])
-    best_model = validation_metrics[validation_metrics["model"].isin(MODEL_NAMES)].iloc[0]["model"]
+    validation_metrics = all_metrics[all_metrics["split"] == "validation"].sort_values(["sMAPE", "MAE"])
+    test_metrics = all_metrics[all_metrics["split"] == "test"].sort_values(["sMAPE", "MAE"])
+    learned_names = [model_config["name"] for model_config in MODEL_CONFIGS]
+    best_model = validation_metrics[validation_metrics["model"].isin(learned_names)].iloc[0]["model"]
+
     best_validation = validation_metrics[validation_metrics["model"] == best_model].iloc[0].to_dict()
     best_test = test_metrics[test_metrics["model"] == best_model].iloc[0].to_dict()
-    baseline_validation = validation_metrics[validation_metrics["model"] == "baseline_last_value"].iloc[0].to_dict()
-    baseline_test = test_metrics[test_metrics["model"] == "baseline_last_value"].iloc[0].to_dict()
+    baseline_validation = validation_metrics[validation_metrics["model"] == OFFICIAL_BASELINE].iloc[0].to_dict()
+    baseline_test = test_metrics[test_metrics["model"] == OFFICIAL_BASELINE].iloc[0].to_dict()
 
     by_tag = summarize_by_tag(all_predictions, best_model)
-    by_type = summarize_by_tag_type(all_predictions)
+    by_tag_type = summarize_by_tag_type(all_predictions)
 
-    all_predictions.to_parquet(config.RAY_MODEL_PREDICTIONS, index=False)
-    overall_metrics.to_csv(config.RAY_MODEL_METRICS_OVERALL, index=False)
-    by_tag.to_csv(config.RAY_MODEL_METRICS_BY_TAG, index=False)
-    by_type.to_csv(config.RAY_MODEL_METRICS_BY_TAG_TYPE, index=False)
+    expected_prediction_rows = (330 + 300) * (len(MODEL_CONFIGS) + 1)
+    if len(all_predictions) != expected_prediction_rows:
+        raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
 
     run_summary = {
-        "official_baseline": "baseline_last_value",
+        "script": "phase2/scripts/run_ray_forecasting.py",
+        "official_baseline": OFFICIAL_BASELINE,
         "model_selection_metric": "validation sMAPE",
         "best_learned_model": best_model,
         "best_learned_validation_metrics": best_validation,
@@ -279,21 +475,20 @@ def main() -> int:
         "baseline_test_metrics": baseline_test,
         "best_learned_beats_baseline_validation_sMAPE": bool(best_validation["sMAPE"] < baseline_validation["sMAPE"]),
         "best_learned_beats_baseline_test_sMAPE": bool(best_test["sMAPE"] < baseline_test["sMAPE"]),
-        "numeric_features": config.NUMERIC_FEATURES,
-        "categorical_features": config.CATEGORICAL_FEATURES,
-        "models_compared": MODEL_NAMES,
+        "gpu_requested": bool(args.use_gpu),
+        "gpu_note": "Sklearn model families are CPU-bound; GPU handling is Ray resource compatibility only.",
+        "numeric_features": NUMERIC_FEATURES,
+        "categorical_features": CATEGORICAL_FEATURES,
+        "models_compared": learned_names,
     }
-    with open(config.RAY_MODEL_RUN_SUMMARY, "w", encoding="utf-8") as handle:
-        json.dump(run_summary, handle, indent=2, default=str)
 
-    expected_prediction_rows = (330 + 300) * (len(MODEL_NAMES) + 1)
-    if len(all_predictions) != expected_prediction_rows:
-        raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
+    print("Saving outputs...")
+    save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, run_summary, baseline_outputs)
 
     print(f"Best learned model: {best_model}")
     print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}; test sMAPE: {best_test['sMAPE']:.4f}")
-    print(f"Saved predictions: {config.RAY_MODEL_PREDICTIONS}")
-    print("PASS")
+    print(f"Saved predictions to {RAY_MODEL_PREDICTIONS}")
+    print(f"Saved metrics to {RAY_MODEL_METRICS_OVERALL}")
     return 0
 
 
