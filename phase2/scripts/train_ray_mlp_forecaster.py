@@ -472,6 +472,16 @@ def is_local_shutdown_warning(error: RayTaskError, paths: dict[str, Path], run_s
     return outputs_exist and "_shutdown_torch" in message and "Expected a cuda device, but got: cpu" in message
 
 
+def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
+    with open(paths["summary"], "r", encoding="utf-8") as handle:
+        saved_summary = json.load(handle)
+    return {
+        "device_used": saved_summary.get("device_used", "unknown"),
+        "validation_sMAPE": saved_summary["best_validation_metrics"]["sMAPE"],
+        "test_sMAPE": saved_summary["test_metrics"]["sMAPE"],
+    }
+
+
 def main() -> int:
     args = parse_args()
     check_args(args)
@@ -524,16 +534,13 @@ def main() -> int:
     try:
         result = trainer.fit()
         result_metrics = result.metrics
+        if result_metrics is None:
+            result_metrics = metrics_from_saved_summary(paths)
+            print("Ray Train returned no final metrics object; using saved run summary.")
     except RayTaskError as error:
         if not is_local_shutdown_warning(error, paths, run_started_at):
             raise
-        with open(paths["summary"], "r", encoding="utf-8") as handle:
-            saved_summary = json.load(handle)
-        result_metrics = {
-            "device_used": saved_summary.get("device_used", "unknown"),
-            "validation_sMAPE": saved_summary["best_validation_metrics"]["sMAPE"],
-            "test_sMAPE": saved_summary["test_metrics"]["sMAPE"],
-        }
+        result_metrics = metrics_from_saved_summary(paths)
         print("Ray Train saved outputs, then hit the known local Windows Torch shutdown warning.")
 
     print(f"Device used: {result_metrics.get('device_used', 'unknown')}")
