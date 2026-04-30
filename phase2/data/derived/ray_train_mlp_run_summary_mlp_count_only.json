@@ -1,0 +1,76 @@
+{
+  "run_label": "mlp_count_only",
+  "features": "phase2/data/derived/top_tags_daily_features.parquet",
+  "include_sentiment": false,
+  "model": "ray_train_mlp",
+  "gpu_requested": true,
+  "device_used": "cuda",
+  "cuda_available_in_worker": true,
+  "model_params": {
+    "input_dim": 43,
+    "hidden_size": 64,
+    "dropout": 0.1,
+    "epochs": 100,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "loss": "SmoothL1Loss on standardized target_next_count"
+  },
+  "best_epoch": 55,
+  "best_validation_metrics": {
+    "split": "validation",
+    "model": "ray_train_mlp",
+    "rows": 330,
+    "MAE": 113.43800612940933,
+    "RMSE": 209.73308313026368,
+    "sMAPE": 36.520148585380255
+  },
+  "test_metrics": {
+    "split": "test",
+    "model": "ray_train_mlp",
+    "rows": 300,
+    "MAE": 104.4423984781901,
+    "RMSE": 182.17663593506006,
+    "sMAPE": 25.733624614944418
+  },
+  "total_training_seconds": 197.93461400998058,
+  "rows": {
+    "train": 1440,
+    "validation": 330,
+    "test": 300
+  },
+  "numeric_features": [
+    "count",
+    "count_lag_1",
+    "count_lag_2",
+    "count_lag_3",
+    "count_lag_7",
+    "rolling_mean_3",
+    "rolling_mean_7",
+    "rolling_std_3",
+    "rolling_std_7",
+    "count_diff_1",
+    "count_pct_change_1"
+  ],
+  "categorical_features": [
+    "tag",
+    "tag_type"
+  ],
+  "feature_count_after_encoding": 43,
+  "classical_count_only_reference": {
+    "path": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_model_metrics_overall_count_only.csv",
+    "best_test_model": "random_forest_pooled",
+    "best_test_MAE": 106.6831947501034,
+    "best_test_RMSE": 190.4295586847528,
+    "best_test_sMAPE": 24.780037561629083
+  },
+  "outputs": {
+    "predictions": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_predictions_mlp_count_only.parquet",
+    "metrics": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_metrics_mlp_count_only.csv",
+    "metrics_by_tag": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_metrics_by_tag_mlp_count_only.csv",
+    "metrics_by_tag_type": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_metrics_by_tag_type_mlp_count_only.csv",
+    "history": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_training_history_mlp_count_only.csv",
+    "training_time": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_training_time_mlp_count_only.csv",
+    "summary": "/home/ubuntu/CS8540-Project/phase2/data/derived/ray_train_mlp_run_summary_mlp_count_only.json"
+  }
+}

@@ -1,0 +1,2 @@
+run_label,model,feature_set,train_seconds,epochs,batch_size,num_workers,use_gpu,device_used
+mlp_count_only,ray_train_mlp,count_only,197.93461400998058,100,64,1,True,cuda

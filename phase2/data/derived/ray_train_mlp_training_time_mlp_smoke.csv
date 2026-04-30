@@ -1,0 +1,2 @@
+run_label,model,feature_set,train_seconds,epochs,batch_size,num_workers,use_gpu,device_used
+mlp_smoke,ray_train_mlp,count_only,3.1690918669919483,3,64,1,False,cpu

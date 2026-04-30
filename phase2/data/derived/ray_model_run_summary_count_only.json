@@ -43,9 +43,9 @@
     "hist_gradient_boosting_pooled"
   ],
   "model_training_seconds": {
-    "linear_regression_pooled": 0.013083072990411893,
-    "ridge_regression_pooled": 0.012323185976129025,
-    "random_forest_pooled": 0.6717150309996214,
-    "hist_gradient_boosting_pooled": 0.19595848399330862
+    "linear_regression_pooled": 0.013766999007202685,
+    "ridge_regression_pooled": 0.012434575997758657,
+    "random_forest_pooled": 0.6732037979818415,
+    "hist_gradient_boosting_pooled": 0.19671455599018373
   }
 }
