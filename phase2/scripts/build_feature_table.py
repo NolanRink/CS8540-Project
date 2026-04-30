@@ -15,9 +15,6 @@ import pyarrow.parquet as pq
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 SPARK_OUTPUT_DIR = PHASE2_ROOT / "data" / "spark_output" / "output"
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
-FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features.parquet"
-SENTIMENT_FEATURES = DERIVED_DIR / "daily_tag_sentiment.parquet"
-SENTIMENT_FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features_with_sentiment.parquet"
 
 START_DATE = "2020-04-09"
 END_DATE = "2020-07-16"
@@ -36,28 +33,19 @@ SENTIMENT_COLUMNS = [
     "neutral_share",
     "avg_sentiment_confidence",
 ]
-SENTIMENT_DERIVED_COLUMNS = [
-    "sentiment_mean_lag_1",
-    "sentiment_mean_lag_3",
-    "sentiment_tweet_count_lag_1",
-    "positive_share_lag_1",
-    "negative_share_lag_1",
-    "sentiment_mean_rolling_3",
-    "sentiment_mean_rolling_7",
-    "positive_share_rolling_3",
-    "negative_share_rolling_3",
-]
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the top-tag feature table.")
     parser.add_argument("--spark-output-dir", type=Path, default=SPARK_OUTPUT_DIR)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--include-sentiment", action="store_true", help="Join daily tag sentiment features.")
-    parser.add_argument("--sentiment-features", type=Path, default=SENTIMENT_FEATURES)
+    parser.add_argument("--sentiment-features", type=Path, default=DERIVED_DIR / "daily_tag_sentiment.parquet")
     args = parser.parse_args()
     if args.output is None:
-        args.output = SENTIMENT_FEATURE_TABLE if args.include_sentiment else FEATURE_TABLE
+        if args.include_sentiment:
+            args.output = DERIVED_DIR / "top_tags_daily_features_with_sentiment.parquet"
+        else:
+            args.output = DERIVED_DIR / "top_tags_daily_features.parquet"
     return args
 
 
@@ -247,7 +235,18 @@ def validate_feature_table(features: pd.DataFrame, include_sentiment: bool = Fal
     split_counts = features.loc[features["modeling_ready"], "split"].value_counts().to_dict()
     expected_target = features.groupby(["tag_type", "tag"], sort=False)["count"].shift(-1)
     if include_sentiment:
-        missing = [col for col in [*SENTIMENT_COLUMNS, *SENTIMENT_DERIVED_COLUMNS] if col not in features.columns]
+        sentiment_derived = [
+            "sentiment_mean_lag_1",
+            "sentiment_mean_lag_3",
+            "sentiment_tweet_count_lag_1",
+            "positive_share_lag_1",
+            "negative_share_lag_1",
+            "sentiment_mean_rolling_3",
+            "sentiment_mean_rolling_7",
+            "positive_share_rolling_3",
+            "negative_share_rolling_3",
+        ]
+        missing = [col for col in [*SENTIMENT_COLUMNS, *sentiment_derived] if col not in features.columns]
         if missing:
             raise ValueError(f"Sentiment-enhanced feature table is missing columns: {missing}")
 

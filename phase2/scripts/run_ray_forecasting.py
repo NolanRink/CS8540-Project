@@ -26,21 +26,6 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
-FEATURE_TABLE = DERIVED_DIR / "top_tags_daily_features.parquet"
-
-BASELINE_PREDICTIONS = DERIVED_DIR / "baseline_forecast_predictions.parquet"
-BASELINE_METRICS_OVERALL = DERIVED_DIR / "baseline_forecast_metrics_overall.csv"
-BASELINE_METRICS_BY_TAG = DERIVED_DIR / "baseline_forecast_metrics_by_tag.csv"
-BASELINE_METRICS_BY_TAG_TYPE = DERIVED_DIR / "baseline_forecast_metrics_by_tag_type.csv"
-
-RAY_MODEL_PREDICTIONS = DERIVED_DIR / "ray_model_predictions.parquet"
-RAY_MODEL_METRICS_OVERALL = DERIVED_DIR / "ray_model_metrics_overall.csv"
-RAY_MODEL_METRICS_BY_TAG = DERIVED_DIR / "ray_model_metrics_by_tag.csv"
-RAY_MODEL_METRICS_BY_TAG_TYPE = DERIVED_DIR / "ray_model_metrics_by_tag_type.csv"
-RAY_MODEL_RUN_SUMMARY = DERIVED_DIR / "ray_model_run_summary.json"
-RAY_MODEL_TRAINING_TIMES = DERIVED_DIR / "ray_model_training_times.csv"
-FORECAST_COMPARISON = DERIVED_DIR / "sentiment_forecast_comparison.csv"
-
 TARGET_COLUMN = "target_next_count"
 BASE_NUMERIC_FEATURES = [
     "count",
@@ -75,7 +60,6 @@ SENTIMENT_NUMERIC_FEATURES = [
     "negative_share_rolling_3",
 ]
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
-EXPECTED_SPLITS = {"train": 1440, "validation": 330, "test": 300}
 OFFICIAL_BASELINE = "baseline_last_value"
 
 MODEL_CONFIGS: list[dict[str, Any]] = [
@@ -103,7 +87,7 @@ MODEL_CONFIGS: list[dict[str, Any]] = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Phase 2 forecasting models.")
-    parser.add_argument("--features", type=Path, default=FEATURE_TABLE)
+    parser.add_argument("--features", type=Path, default=DERIVED_DIR / "top_tags_daily_features.parquet")
     parser.add_argument("--run-label", default=None, help="Optional label used to save run-specific outputs.")
     parser.add_argument("--include-sentiment", action="store_true", help="Use sentiment numeric features if present.")
     parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
@@ -121,18 +105,19 @@ def labeled_path(path: Path, run_label: str | None) -> Path:
 
 
 def output_paths(run_label: str | None) -> dict[str, Path]:
-    return {
-        "baseline_predictions": labeled_path(BASELINE_PREDICTIONS, run_label),
-        "baseline_metrics_overall": labeled_path(BASELINE_METRICS_OVERALL, run_label),
-        "baseline_metrics_by_tag": labeled_path(BASELINE_METRICS_BY_TAG, run_label),
-        "baseline_metrics_by_tag_type": labeled_path(BASELINE_METRICS_BY_TAG_TYPE, run_label),
-        "ray_predictions": labeled_path(RAY_MODEL_PREDICTIONS, run_label),
-        "ray_metrics_overall": labeled_path(RAY_MODEL_METRICS_OVERALL, run_label),
-        "ray_metrics_by_tag": labeled_path(RAY_MODEL_METRICS_BY_TAG, run_label),
-        "ray_metrics_by_tag_type": labeled_path(RAY_MODEL_METRICS_BY_TAG_TYPE, run_label),
-        "run_summary": labeled_path(RAY_MODEL_RUN_SUMMARY, run_label),
-        "training_times": labeled_path(RAY_MODEL_TRAINING_TIMES, run_label),
+    names = {
+        "baseline_predictions": "baseline_forecast_predictions.parquet",
+        "baseline_metrics_overall": "baseline_forecast_metrics_overall.csv",
+        "baseline_metrics_by_tag": "baseline_forecast_metrics_by_tag.csv",
+        "baseline_metrics_by_tag_type": "baseline_forecast_metrics_by_tag_type.csv",
+        "ray_predictions": "ray_model_predictions.parquet",
+        "ray_metrics_overall": "ray_model_metrics_overall.csv",
+        "ray_metrics_by_tag": "ray_model_metrics_by_tag.csv",
+        "ray_metrics_by_tag_type": "ray_model_metrics_by_tag_type.csv",
+        "run_summary": "ray_model_run_summary.json",
+        "training_times": "ray_model_training_times.csv",
     }
+    return {key: labeled_path(DERIVED_DIR / name, run_label) for key, name in names.items()}
 
 
 def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
@@ -184,7 +169,8 @@ def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd
         .reset_index(drop=True)
     )
     split_counts = modeling["split"].value_counts().to_dict()
-    if split_counts != EXPECTED_SPLITS:
+    expected_splits = {"train": 1440, "validation": 330, "test": 300}
+    if split_counts != expected_splits:
         raise ValueError(f"Unexpected modeling split counts: {split_counts}")
     return modeling, selected_numeric
 
@@ -475,18 +461,19 @@ def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> 
     if run_label is None:
         return
 
+    comparison_path = DERIVED_DIR / "sentiment_forecast_comparison.csv"
     rows = metrics[["split", "model", "rows", "MAE", "RMSE", "sMAPE"]].copy()
     rows.insert(0, "run_label", run_label)
 
-    if FORECAST_COMPARISON.exists():
-        comparison = pd.read_csv(FORECAST_COMPARISON)
+    if comparison_path.exists():
+        comparison = pd.read_csv(comparison_path)
         comparison = comparison[comparison["run_label"] != run_label]
         comparison = pd.concat([comparison, rows], ignore_index=True)
     else:
         comparison = rows
 
     comparison = comparison.sort_values(["run_label", "split", "sMAPE", "MAE"])
-    comparison.to_csv(FORECAST_COMPARISON, index=False)
+    comparison.to_csv(comparison_path, index=False)
 
 
 def main() -> int:
@@ -583,7 +570,7 @@ def main() -> int:
     print(f"Saved metrics to {paths['ray_metrics_overall']}")
     print(f"Saved training times to {paths['training_times']}")
     if args.run_label is not None:
-        print(f"Updated comparison CSV at {FORECAST_COMPARISON}")
+        print(f"Updated comparison CSV at {DERIVED_DIR / 'sentiment_forecast_comparison.csv'}")
     return 0
 
 
