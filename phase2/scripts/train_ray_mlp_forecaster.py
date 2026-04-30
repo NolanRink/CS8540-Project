@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from ray import train
@@ -318,7 +319,8 @@ def train_loop(config: dict[str, Any]) -> None:
     best_state = None
     start_time = time.perf_counter()
 
-    for epoch in range(1, config["epochs"] + 1):
+    progress = tqdm(range(1, config["epochs"] + 1), desc="MLP epochs", dynamic_ncols=True)
+    for epoch in progress:
         model.train()
         losses = []
         for x_batch, y_batch in train_loader:
@@ -342,6 +344,7 @@ def train_loop(config: dict[str, Any]) -> None:
             "elapsed_seconds": elapsed,
         }
         history.append(row)
+        progress.set_postfix(train_loss=f"{row['train_loss']:.4f}", val_smape=f"{row['validation_sMAPE']:.2f}")
 
         if validation_metrics["sMAPE"] < best_smape:
             best_smape = validation_metrics["sMAPE"]
