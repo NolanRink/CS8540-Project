@@ -1,14 +1,9 @@
 """Run the Phase 2 forecasting baselines and pooled Ray models."""
 
-from __future__ import annotations
-
-import argparse
 import json
 import logging
-import re
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +21,9 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
+RUN_LABEL = "count_only"
+NUM_CPUS = 4
 TARGET_COLUMN = "target_next_count"
 BASE_NUMERIC_FEATURES = [
     "count",
@@ -39,25 +37,6 @@ BASE_NUMERIC_FEATURES = [
     "rolling_std_7",
     "count_diff_1",
     "count_pct_change_1",
-]
-SENTIMENT_NUMERIC_FEATURES = [
-    "sentiment_mean",
-    "sentiment_median",
-    "sentiment_std",
-    "sentiment_tweet_count",
-    "positive_share",
-    "negative_share",
-    "neutral_share",
-    "avg_sentiment_confidence",
-    "sentiment_mean_lag_1",
-    "sentiment_mean_lag_3",
-    "sentiment_tweet_count_lag_1",
-    "positive_share_lag_1",
-    "negative_share_lag_1",
-    "sentiment_mean_rolling_3",
-    "sentiment_mean_rolling_7",
-    "positive_share_rolling_3",
-    "negative_share_rolling_3",
 ]
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
 OFFICIAL_BASELINE = "baseline_last_value"
@@ -85,17 +64,7 @@ MODEL_CONFIGS: list[dict[str, Any]] = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Phase 2 forecasting models.")
-    parser.add_argument("--features", type=Path, default=DERIVED_DIR / "top_tags_daily_features.parquet")
-    parser.add_argument("--run-label", default=None, help="Optional label used to save run-specific outputs.")
-    parser.add_argument("--include-sentiment", action="store_true", help="Use sentiment numeric features if present.")
-    parser.add_argument("--num-workers", type=int, default=min(4, len(MODEL_CONFIGS)))
-    parser.add_argument("--num-cpus", type=int, default=None)
-    parser.add_argument("--smoke-test", action="store_true", help="Check data loading and Ray startup without training.")
-    parser.add_argument("--use-gpu", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--reserve-gpu-resource", action="store_true", help=argparse.SUPPRESS)
-    return parser.parse_args()
+NUM_WORKERS = min(4, len(MODEL_CONFIGS))
 
 
 def labeled_path(path: Path, run_label: str | None) -> Path:
@@ -139,14 +108,12 @@ def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str
     }
 
 
-def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd.DataFrame, list[str]]:
+def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
     features = pd.read_parquet(feature_path)
     selected_numeric = BASE_NUMERIC_FEATURES.copy()
-    if include_sentiment:
-        selected_numeric += SENTIMENT_NUMERIC_FEATURES
     required = [
         "date",
         "tag",
@@ -314,17 +281,16 @@ def train_model_worker(
     }
 
 
-def start_ray(num_workers: int, num_cpus: int | None, use_gpu: bool, reserve_gpu_resource: bool) -> tuple[int, float]:
+def start_ray(num_workers: int, num_cpus: int | None) -> tuple[int, float]:
     if num_workers < 1:
-        raise ValueError("--num-workers must be at least 1")
+        raise ValueError("NUM_WORKERS must be at least 1")
     if num_cpus is not None and num_cpus < 1:
-        raise ValueError("--num-cpus must be at least 1")
+        raise ValueError("NUM_CPUS must be at least 1")
 
     total_cpus = num_cpus or max(1, num_workers)
     if ray.is_initialized():
         ray.shutdown()
 
-    warnings.filterwarnings("ignore", message="Tip: In future versions of Ray.*", category=FutureWarning)
     ray.init(
         include_dashboard=False,
         ignore_reinit_error=True,
@@ -333,17 +299,11 @@ def start_ray(num_workers: int, num_cpus: int | None, use_gpu: bool, reserve_gpu
         num_cpus=total_cpus,
     )
     resources = ray.cluster_resources()
-    visible_gpus = float(resources.get("GPU", 0.0))
-
-    if use_gpu:
-        print(f"Ray sees {visible_gpus:g} GPU resource(s); sklearn models remain CPU-bound.")
-
-    gpus_per_worker = 0.0
-    if reserve_gpu_resource and visible_gpus > 0:
-        gpus_per_worker = min(1.0, visible_gpus / max(1, num_workers))
+    if float(resources.get("GPU", 0.0)) > 0:
+        print("Ray sees GPU resources, but these sklearn models are CPU-bound.")
 
     cpus_per_worker = max(1, total_cpus // max(1, num_workers))
-    return cpus_per_worker, gpus_per_worker
+    return cpus_per_worker, 0.0
 
 
 def run_ray_models(
@@ -351,14 +311,12 @@ def run_ray_models(
     numeric_feature_names: list[str],
     num_workers: int,
     num_cpus: int | None,
-    use_gpu: bool,
-    reserve_gpu_resource: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     train = modeling[modeling["split"] == "train"].copy()
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
 
-    cpus_per_worker, gpus_per_worker = start_ray(num_workers, num_cpus, use_gpu, reserve_gpu_resource)
+    cpus_per_worker, gpus_per_worker = start_ray(num_workers, num_cpus)
     try:
         futures = [
             train_model_worker.options(num_cpus=cpus_per_worker, num_gpus=gpus_per_worker).remote(
@@ -477,30 +435,13 @@ def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> 
 
 
 def main() -> int:
-    args = parse_args()
-    if args.run_label and not re.fullmatch(r"[A-Za-z0-9_]+", args.run_label):
-        raise ValueError("--run-label may contain only letters, numbers, and underscores.")
-    paths = output_paths(args.run_label)
+    paths = output_paths(RUN_LABEL)
 
     print("Loading features")
-    modeling, selected_numeric = load_modeling_frame(args.features, args.include_sentiment)
+    modeling, selected_numeric = load_modeling_frame(FEATURE_TABLE_PATH)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
     print(f"Rows by split: {split_counts}")
     print(f"Numeric feature count: {len(selected_numeric)}")
-    if args.include_sentiment:
-        covered = int((modeling["sentiment_tweet_count"] > 0).sum())
-        if covered / len(modeling) < 0.05:
-            print(
-                "Low sentiment coverage: "
-                f"{covered:,}/{len(modeling):,} modeling rows. Treat this as a smoke-test run."
-            )
-
-    if args.smoke_test:
-        print("Checking Ray startup")
-        start_ray(args.num_workers, args.num_cpus, args.use_gpu, args.reserve_gpu_resource)
-        ray.shutdown()
-        print("Ray smoke test passed")
-        return 0
 
     print("Scoring baselines")
     baseline_outputs = run_baselines(modeling)
@@ -510,10 +451,8 @@ def main() -> int:
     learned_predictions, learned_metrics, training_times = run_ray_models(
         modeling,
         selected_numeric,
-        args.num_workers,
-        args.num_cpus,
-        args.use_gpu,
-        args.reserve_gpu_resource,
+        NUM_WORKERS,
+        NUM_CPUS,
     )
     all_predictions, all_metrics = add_baseline_to_comparison(
         learned_predictions,
@@ -535,8 +474,8 @@ def main() -> int:
     by_tag = summarize_by_tag(all_predictions, best_model)
     by_tag_type = summarize_by_tag_type(all_predictions)
     training_times = training_times.copy()
-    training_times.insert(0, "run_label", args.run_label or "default")
-    training_times["feature_set"] = "count_plus_sentiment" if args.include_sentiment else "count_only"
+    training_times.insert(0, "run_label", RUN_LABEL)
+    training_times["feature_set"] = "count_only"
     training_times["rows_train"] = int((modeling["split"] == "train").sum())
     training_times["num_numeric_features"] = len(selected_numeric)
 
@@ -545,9 +484,9 @@ def main() -> int:
         raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
 
     run_summary = {
-        "run_label": args.run_label,
-        "features": str(args.features),
-        "include_sentiment": bool(args.include_sentiment),
+        "run_label": RUN_LABEL,
+        "features": str(FEATURE_TABLE_PATH),
+        "include_sentiment": False,
         "official_baseline": OFFICIAL_BASELINE,
         "best_learned_model": best_model,
         "best_learned_validation_metrics": best_validation,
@@ -562,15 +501,14 @@ def main() -> int:
 
     print("Saving results")
     save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, training_times, run_summary, baseline_outputs, paths)
-    update_forecast_comparison(all_metrics, args.run_label)
+    update_forecast_comparison(all_metrics, RUN_LABEL)
 
     print(f"Best learned model: {best_model}")
     print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}; test sMAPE: {best_test['sMAPE']:.4f}")
     print(f"Saved predictions to {paths['ray_predictions']}")
     print(f"Saved metrics to {paths['ray_metrics_overall']}")
     print(f"Saved training times to {paths['training_times']}")
-    if args.run_label is not None:
-        print(f"Updated comparison CSV at {DERIVED_DIR / 'sentiment_forecast_comparison.csv'}")
+    print(f"Updated comparison CSV at {DERIVED_DIR / 'sentiment_forecast_comparison.csv'}")
     return 0
 
 

@@ -1,8 +1,5 @@
 """Build the daily feature table for the selected Phase 2 tags."""
 
-from __future__ import annotations
-
-import argparse
 import sys
 from pathlib import Path
 
@@ -15,6 +12,7 @@ import pyarrow.parquet as pq
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 SPARK_OUTPUT_DIR = PHASE2_ROOT / "data" / "spark_output" / "output"
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
 
 START_DATE = "2020-04-09"
 END_DATE = "2020-07-16"
@@ -23,30 +21,6 @@ MIN_OBSERVED_DAYS = 60
 TRAIN_DATES = 55
 VALIDATION_DATES = 11
 TARGET_COLUMN = "target_next_count"
-SENTIMENT_COLUMNS = [
-    "sentiment_tweet_count",
-    "sentiment_mean",
-    "sentiment_median",
-    "sentiment_std",
-    "positive_share",
-    "negative_share",
-    "neutral_share",
-    "avg_sentiment_confidence",
-]
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the top-tag feature table.")
-    parser.add_argument("--spark-output-dir", type=Path, default=SPARK_OUTPUT_DIR)
-    parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--include-sentiment", action="store_true", help="Join daily tag sentiment features.")
-    parser.add_argument("--sentiment-features", type=Path, default=DERIVED_DIR / "daily_tag_sentiment.parquet")
-    args = parser.parse_args()
-    if args.output is None:
-        if args.include_sentiment:
-            args.output = DERIVED_DIR / "top_tags_daily_features_with_sentiment.parquet"
-        else:
-            args.output = DERIVED_DIR / "top_tags_daily_features.parquet"
-    return args
 
 
 def read_daily_counts(path: Path, tag_type: str) -> pd.DataFrame:
@@ -150,55 +124,6 @@ def add_features(panel: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def load_sentiment_features(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing sentiment features: {path}")
-
-    sentiment = pd.read_parquet(path)
-    required = ["date", "tag", "tag_type", *SENTIMENT_COLUMNS]
-    missing = [col for col in required if col not in sentiment.columns]
-    if missing:
-        raise ValueError(f"{path} is missing columns: {missing}")
-
-    sentiment = sentiment[required].copy()
-    sentiment["date"] = pd.to_datetime(sentiment["date"], errors="coerce")
-    sentiment = sentiment.dropna(subset=["date", "tag", "tag_type"])
-    sentiment["tag"] = sentiment["tag"].astype(str)
-    sentiment["tag_type"] = sentiment["tag_type"].astype(str)
-
-    if sentiment.duplicated(["date", "tag_type", "tag"]).any():
-        raise ValueError("Sentiment features have duplicate date/tag_type/tag rows.")
-    return sentiment
-
-
-def add_sentiment_features(features: pd.DataFrame, sentiment: pd.DataFrame) -> pd.DataFrame:
-    merged = features.merge(sentiment, on=["date", "tag", "tag_type"], how="left")
-
-    # Missing rows mean no scored tweet matched that date/tag in the sentiment file.
-    for column in SENTIMENT_COLUMNS:
-        merged[column] = merged[column].fillna(0.0)
-    merged["sentiment_tweet_count"] = merged["sentiment_tweet_count"].astype("int64")
-
-    group_cols = ["tag_type", "tag"]
-    grouped = merged.groupby(group_cols, sort=False)
-
-    merged["sentiment_mean_lag_1"] = grouped["sentiment_mean"].shift(1)
-    merged["sentiment_mean_lag_3"] = grouped["sentiment_mean"].shift(3)
-    merged["sentiment_tweet_count_lag_1"] = grouped["sentiment_tweet_count"].shift(1)
-    merged["positive_share_lag_1"] = grouped["positive_share"].shift(1)
-    merged["negative_share_lag_1"] = grouped["negative_share"].shift(1)
-
-    for window in [3, 7]:
-        sentiment_roll = grouped["sentiment_mean"].rolling(window=window, min_periods=window)
-        merged[f"sentiment_mean_rolling_{window}"] = sentiment_roll.mean().reset_index(level=group_cols, drop=True)
-
-    for column in ["positive_share", "negative_share"]:
-        roll = grouped[column].rolling(window=3, min_periods=3)
-        merged[f"{column}_rolling_3"] = roll.mean().reset_index(level=group_cols, drop=True)
-
-    return merged
-
-
 def add_splits(features: pd.DataFrame) -> pd.DataFrame:
     dates = pd.DataFrame({"date": sorted(features["date"].dropna().unique())}).reset_index(names="date_position")
     dates["split"] = np.select(
@@ -230,26 +155,10 @@ def add_splits(features: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def validate_feature_table(features: pd.DataFrame, include_sentiment: bool = False) -> None:
+def validate_feature_table(features: pd.DataFrame) -> None:
     tag_counts = features[["tag_type", "tag"]].drop_duplicates().groupby("tag_type").size().to_dict()
     split_counts = features.loc[features["modeling_ready"], "split"].value_counts().to_dict()
     expected_target = features.groupby(["tag_type", "tag"], sort=False)["count"].shift(-1)
-    if include_sentiment:
-        sentiment_derived = [
-            "sentiment_mean_lag_1",
-            "sentiment_mean_lag_3",
-            "sentiment_tweet_count_lag_1",
-            "positive_share_lag_1",
-            "negative_share_lag_1",
-            "sentiment_mean_rolling_3",
-            "sentiment_mean_rolling_7",
-            "positive_share_rolling_3",
-            "negative_share_rolling_3",
-        ]
-        missing = [col for col in [*SENTIMENT_COLUMNS, *sentiment_derived] if col not in features.columns]
-        if missing:
-            raise ValueError(f"Sentiment-enhanced feature table is missing columns: {missing}")
-
     if tag_counts != {"hashtag": 15, "cashtag": 15}:
         raise ValueError(f"Unexpected selected tag counts: {tag_counts}")
     if features["date"].nunique() != 77:
@@ -263,36 +172,22 @@ def validate_feature_table(features: pd.DataFrame, include_sentiment: bool = Fal
 
 
 def main() -> int:
-    args = parse_args()
     print("Loading daily counts")
-    daily_counts = load_counts(args.spark_output_dir)
+    daily_counts = load_counts(SPARK_OUTPUT_DIR)
 
     print("Building feature table")
     selected_tags = select_top_tags(daily_counts)
     panel = build_panel(daily_counts, selected_tags)
     features = add_features(panel)
 
-    if args.include_sentiment:
-        print("Adding sentiment features")
-        sentiment = load_sentiment_features(args.sentiment_features)
-        features = add_sentiment_features(features, sentiment)
-
     features = add_splits(features)
-    validate_feature_table(features, include_sentiment=args.include_sentiment)
+    validate_feature_table(features)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(args.output, index=False)
+    FEATURE_TABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    features.to_parquet(FEATURE_TABLE_PATH, index=False)
 
-    print(f"Saved {args.output}")
+    print(f"Saved {FEATURE_TABLE_PATH}")
     print(f"Rows: {len(features):,}; modeling-ready rows: {int(features['modeling_ready'].sum()):,}")
-    if args.include_sentiment:
-        covered = int((features["sentiment_tweet_count"] > 0).sum())
-        coverage = covered / len(features)
-        if coverage < 0.05:
-            print(
-                "Low sentiment coverage: "
-                f"{covered:,}/{len(features):,} rows. That is expected for smoke-test sentiment files."
-            )
     return 0
 
 

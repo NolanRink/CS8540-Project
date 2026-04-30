@@ -1,11 +1,7 @@
 """Train a small Ray Train PyTorch MLP for next-day tag-count forecasting."""
 
-from __future__ import annotations
-
-import argparse
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -18,13 +14,23 @@ from tqdm import tqdm
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from ray import train
-from ray.exceptions import RayTaskError
 from ray.train import ScalingConfig
 from ray.train.torch import TorchConfig, TorchTrainer
 
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
+RUN_LABEL = "mlp_count_only"
+NUM_WORKERS = 1
+USE_GPU = True
+EPOCHS = 100
+BATCH_SIZE = 64
+HIDDEN_SIZE = 64
+DROPOUT = 0.1
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+SEED = 42
 TARGET_COLUMN = "target_next_count"
 MODEL_NAME = "ray_train_mlp"
 
@@ -40,25 +46,6 @@ BASE_NUMERIC_FEATURES = [
     "rolling_std_7",
     "count_diff_1",
     "count_pct_change_1",
-]
-SENTIMENT_NUMERIC_FEATURES = [
-    "sentiment_mean",
-    "sentiment_median",
-    "sentiment_std",
-    "sentiment_tweet_count",
-    "positive_share",
-    "negative_share",
-    "neutral_share",
-    "avg_sentiment_confidence",
-    "sentiment_mean_lag_1",
-    "sentiment_mean_lag_3",
-    "sentiment_tweet_count_lag_1",
-    "positive_share_lag_1",
-    "negative_share_lag_1",
-    "sentiment_mean_rolling_3",
-    "sentiment_mean_rolling_7",
-    "positive_share_rolling_3",
-    "negative_share_rolling_3",
 ]
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
 
@@ -77,23 +64,6 @@ class MLPRegressor(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(1)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Ray Train MLP forecaster.")
-    parser.add_argument("--features", type=Path, default=DERIVED_DIR / "top_tags_daily_features.parquet")
-    parser.add_argument("--run-label", default="mlp_count_only")
-    parser.add_argument("--include-sentiment", action="store_true")
-    parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument("--use-gpu", action="store_true")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--hidden-size", type=int, default=64)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
 
 
 def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
@@ -127,35 +97,12 @@ def output_paths(run_label: str) -> dict[str, Path]:
     }
 
 
-def check_args(args: argparse.Namespace) -> None:
-    if not re.fullmatch(r"[A-Za-z0-9_]+", args.run_label):
-        raise ValueError("--run-label may contain only letters, numbers, and underscores.")
-    if args.num_workers < 1:
-        raise ValueError("--num-workers must be at least 1.")
-    if args.num_workers != 1:
-        raise ValueError("This small course-project MLP uses --num-workers 1.")
-    if args.epochs < 1:
-        raise ValueError("--epochs must be at least 1.")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be at least 1.")
-    if args.hidden_size < 4:
-        raise ValueError("--hidden-size must be at least 4.")
-    if not 0 <= args.dropout < 1:
-        raise ValueError("--dropout must be in [0, 1).")
-    if args.learning_rate <= 0:
-        raise ValueError("--learning-rate must be positive.")
-    if args.weight_decay < 0:
-        raise ValueError("--weight-decay cannot be negative.")
-
-
-def load_modeling_frame(feature_path: Path, include_sentiment: bool) -> tuple[pd.DataFrame, list[str]]:
+def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
     features = pd.read_parquet(feature_path)
     numeric_features = BASE_NUMERIC_FEATURES.copy()
-    if include_sentiment:
-        numeric_features += SENTIMENT_NUMERIC_FEATURES
 
     required = [
         "date",
@@ -464,12 +411,6 @@ def train_loop(config: dict[str, Any]) -> None:
     )
 
 
-def is_local_shutdown_warning(error: RayTaskError, paths: dict[str, Path], run_started_at: float) -> bool:
-    message = str(error)
-    outputs_exist = all(path.exists() and path.stat().st_mtime >= run_started_at for path in paths.values())
-    return outputs_exist and "_shutdown_torch" in message and "Expected a cuda device, but got: cpu" in message
-
-
 def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
     with open(paths["summary"], "r", encoding="utf-8") as handle:
         saved_summary = json.load(handle)
@@ -481,65 +422,56 @@ def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
 
 
 def main() -> int:
-    args = parse_args()
-    check_args(args)
     os.environ.setdefault("USE_LIBUV", "0")
     os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    if not args.use_gpu:
+    if not USE_GPU:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-    if args.use_gpu and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Run without --use-gpu for CPU smoke testing.")
+    if USE_GPU and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. Run this final MLP script on a FABRIC GPU node.")
 
     print("Loading features")
-    modeling, numeric_features = load_modeling_frame(args.features, args.include_sentiment)
+    modeling, numeric_features = load_modeling_frame(FEATURE_TABLE_PATH)
     arrays = prepare_arrays(modeling, numeric_features)
-    paths = output_paths(args.run_label)
+    paths = output_paths(RUN_LABEL)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
 
     print(f"Rows by split: {split_counts}")
     print(f"Numeric features: {len(numeric_features)}")
     print(f"Encoded feature count: {len(arrays['feature_names'])}")
-    print(f"Ray Train GPU requested: {args.use_gpu}")
+    print(f"Ray Train GPU requested: {USE_GPU}")
 
     train_config = {
         **arrays,
-        "run_label": args.run_label,
-        "features": str(args.features),
-        "include_sentiment": bool(args.include_sentiment),
+        "run_label": RUN_LABEL,
+        "features": str(FEATURE_TABLE_PATH),
+        "include_sentiment": False,
         "input_dim": len(arrays["feature_names"]),
-        "hidden_size": args.hidden_size,
-        "dropout": args.dropout,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "seed": args.seed,
-        "num_workers": args.num_workers,
-        "use_gpu": bool(args.use_gpu),
+        "hidden_size": HIDDEN_SIZE,
+        "dropout": DROPOUT,
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "seed": SEED,
+        "num_workers": NUM_WORKERS,
+        "use_gpu": USE_GPU,
         "output_paths": {key: str(value) for key, value in paths.items()},
         "classical_reference": find_classical_reference(),
     }
 
     print("Training Ray Train MLP")
-    run_started_at = time.time()
     trainer = TorchTrainer(
         train_loop_per_worker=train_loop,
         train_loop_config=train_config,
-        scaling_config=ScalingConfig(num_workers=args.num_workers, use_gpu=args.use_gpu),
+        scaling_config=ScalingConfig(num_workers=NUM_WORKERS, use_gpu=USE_GPU),
         torch_config=TorchConfig(backend="gloo"),
     )
-    try:
-        result = trainer.fit()
-        result_metrics = result.metrics
-        if result_metrics is None:
-            result_metrics = metrics_from_saved_summary(paths)
-            print("Ray Train returned no final metrics object; using saved run summary.")
-    except RayTaskError as error:
-        if not is_local_shutdown_warning(error, paths, run_started_at):
-            raise
+    result = trainer.fit()
+    result_metrics = result.metrics
+    if result_metrics is None:
         result_metrics = metrics_from_saved_summary(paths)
-        print("Ray Train saved outputs, then hit the known local Windows Torch shutdown warning.")
+        print("Loaded final metrics from saved run summary.")
 
     print(f"Device used: {result_metrics.get('device_used', 'unknown')}")
     print(f"Validation sMAPE: {result_metrics['validation_sMAPE']:.4f}")
