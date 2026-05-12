@@ -19,6 +19,7 @@ export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
 # Spark script handles these paths now.
 SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
 SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
+FEATURE_TABLE="phase2/data/derived/top_tags_daily_features.parquet"
 DATA_URL="https://huggingface.co/datasets/StephanAkkerman/stock-market-tweets-data/resolve/main/stock-market-tweets-data.csv"
 
 if [ ! -f "$SPARK_INPUT" ]; then
@@ -33,12 +34,22 @@ echo "Running Spark preprocessing"
   --output-dir "$SPARK_OUTPUT_DIR"
 
 echo "Building feature table"
-python phase2/scripts/build_feature_table.py
+python phase2/scripts/build_feature_table.py \
+  --spark-output-dir "$SPARK_OUTPUT_DIR" \
+  --output "$FEATURE_TABLE"
 
 echo "Running classical Ray forecasting"
-python -u phase2/scripts/run_ray_forecasting.py
+python -u phase2/scripts/run_ray_forecasting.py \
+  --features "$FEATURE_TABLE" \
+  --run-label count_only
 
 echo "Training Ray/PyTorch MLP forecaster"
-python -u phase2/scripts/train_ray_mlp_forecaster.py
+python -u phase2/scripts/train_ray_mlp_forecaster.py \
+  --features "$FEATURE_TABLE" \
+  --run-label mlp_count_only \
+  --num-workers 1 \
+  --epochs 100 \
+  --batch-size 64 \
+  --use-gpu
 
 echo "Phase 2 pipeline finished"
