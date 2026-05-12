@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
+
+# Path and run settings
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
 FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
 RUN_LABEL = "mlp_count_only"
@@ -60,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Let --help work before Ray/Torch are installed.
+# Delay ML imports so --help still works on a new VM.
 if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
     parse_args()
     sys.exit(0)
@@ -76,6 +78,7 @@ from ray.train import ScalingConfig
 from ray.train.torch import TorchConfig, TorchTrainer
 
 
+# Model and training settings
 HIDDEN_SIZE = 64
 DROPOUT = 0.1
 LEARNING_RATE = 1e-3
@@ -84,6 +87,7 @@ SEED = 42
 TARGET_COLUMN = "target_next_count"
 MODEL_NAME = "ray_train_mlp"
 
+# Feature columns used by the MLP
 BASE_NUMERIC_FEATURES = [
     "count",
     "count_lag_1",
@@ -101,6 +105,8 @@ CATEGORICAL_FEATURES = ["tag", "tag_type"]
 
 
 class MLPRegressor(nn.Module):
+    """Small MLP that maps x shaped (batch, input_dim) to predictions shaped (batch,)."""
+
     def __init__(self, input_dim: int, hidden_size: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
@@ -113,10 +119,12 @@ class MLPRegressor(nn.Module):
         )
 
     def forward(self, x):
+        """Return one prediction per input row."""
         return self.net(x).squeeze(1)
 
 
 def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
+    """Return symmetric MAPE as a percentage."""
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
     denominator = (np.abs(actual) + np.abs(predicted)) / 2
@@ -125,6 +133,7 @@ def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndar
 
 
 def metric_row(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> dict[str, float | int]:
+    """Build one MAE/RMSE/sMAPE metric row."""
     actual_values = np.asarray(actual, dtype=float)
     predicted_values = np.asarray(predicted, dtype=float)
     return {
@@ -136,6 +145,7 @@ def metric_row(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray
 
 
 def output_paths(run_label: str) -> dict[str, Path]:
+    """Build the MLP output file paths for this run label."""
     return {
         "predictions": DERIVED_DIR / f"ray_train_mlp_predictions_{run_label}.parquet",
         "metrics": DERIVED_DIR / f"ray_train_mlp_metrics_{run_label}.csv",
@@ -148,6 +158,7 @@ def output_paths(run_label: str) -> dict[str, Path]:
 
 
 def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
+    """Load feature rows that are ready for MLP training."""
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
@@ -182,20 +193,25 @@ def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
 
 
 def prepare_arrays(modeling: pd.DataFrame, numeric_features: list[str]) -> dict[str, Any]:
+    """Convert the modeling frame into arrays for Ray Train."""
     train_mask = modeling["split"].eq("train")
     train_frame = modeling.loc[train_mask].copy()
 
+    # Fill numeric missing values with train-set medians.
     numeric = modeling[numeric_features].replace([np.inf, -np.inf], np.nan)
     medians = train_frame[numeric_features].replace([np.inf, -np.inf], np.nan).median().fillna(0.0)
     numeric = numeric.fillna(medians)
 
+    # Scale numeric features using train-set statistics only.
     means = numeric.loc[train_mask].mean()
     stds = numeric.loc[train_mask].std(ddof=0).replace(0, 1).fillna(1.0)
     numeric_scaled = (numeric - means) / stds
 
+    # One-hot encode tag name and tag type.
     categories = pd.get_dummies(modeling[CATEGORICAL_FEATURES].astype(str), columns=CATEGORICAL_FEATURES)
     feature_frame = pd.concat([numeric_scaled, categories.astype(float)], axis=1)
 
+    # Train on a standardized target, then convert predictions back later.
     y = modeling[TARGET_COLUMN].astype(float).to_numpy()
     y_train = y[train_mask.to_numpy()]
     target_mean = float(np.mean(y_train))
@@ -216,6 +232,8 @@ def prepare_arrays(modeling: pd.DataFrame, numeric_features: list[str]) -> dict[
 
     x_values = feature_frame.to_numpy(dtype="float32")
     y_values = y_scaled.astype("float32")
+
+    # Keep separate arrays for the fixed train/validation/test splits.
     for split_name in ["train", "validation", "test"]:
         mask = modeling["split"].eq(split_name).to_numpy()
         arrays[f"x_{split_name}"] = x_values[mask]
@@ -225,6 +243,7 @@ def prepare_arrays(modeling: pd.DataFrame, numeric_features: list[str]) -> dict[
 
 
 def find_classical_reference() -> dict[str, Any] | None:
+    """Read the best classical model result if that run has already finished."""
     path = DERIVED_DIR / "ray_model_metrics_overall_count_only.csv"
     if not path.exists():
         return None
@@ -243,6 +262,7 @@ def find_classical_reference() -> dict[str, Any] | None:
 
 
 def summarize_by_tag(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Summarize MLP test metrics by tag."""
     rows = []
     test_predictions = predictions[predictions["split"].eq("test")]
     for (tag_type, tag), group in test_predictions.groupby(["tag_type", "tag"]):
@@ -258,6 +278,7 @@ def summarize_by_tag(predictions: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_by_tag_type(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Summarize MLP metrics by hashtag versus cashtag."""
     rows = []
     for (split_name, tag_type), group in predictions.groupby(["split", "tag_type"]):
         rows.append(
@@ -274,13 +295,16 @@ def summarize_by_tag_type(predictions: pd.DataFrame) -> pd.DataFrame:
 def train_loop(config: dict[str, Any]) -> None:
     import ray.train.torch as ray_torch
 
+    # Keep the final run reproducible.
     torch.manual_seed(config["seed"])
     np.random.seed(config["seed"])
 
+    # The final Phase 2 run is expected to use a CUDA worker on FABRIC.
     device = ray_torch.get_device()
     if config["use_gpu"] and (device.type != "cuda" or not torch.cuda.is_available()):
         raise RuntimeError("Ray Train was asked to use GPU, but CUDA is not available in the worker.")
 
+    # Ray Train works with normal PyTorch dataloaders.
     x_train = torch.tensor(config["x_train"], dtype=torch.float32)
     y_train = torch.tensor(config["y_train"], dtype=torch.float32)
     train_loader = DataLoader(
@@ -290,6 +314,7 @@ def train_loop(config: dict[str, Any]) -> None:
     )
     train_loader = ray_torch.prepare_data_loader(train_loader)
 
+    # Build the model, optimizer, and loss used by every worker.
     model = MLPRegressor(config["input_dim"], config["hidden_size"], config["dropout"]).to(device)
     if config["use_gpu"]:
         model = ray_torch.prepare_model(model)
@@ -318,6 +343,7 @@ def train_loop(config: dict[str, Any]) -> None:
     best_state = None
     start_time = time.perf_counter()
 
+    # Track the best validation state while still reporting every epoch to Ray.
     for epoch in range(1, config["epochs"] + 1):
         model.train()
         losses = []
@@ -366,6 +392,7 @@ def train_loop(config: dict[str, Any]) -> None:
     validation_metrics = metric_row(config["actual_validation"], validation_pred)
     test_metrics = metric_row(config["actual_test"], test_pred)
 
+    # Evaluate the saved best model on validation and test rows.
     metrics = pd.DataFrame(
         [
             {"split": "validation", "model": MODEL_NAME, **validation_metrics},
@@ -402,6 +429,7 @@ def train_loop(config: dict[str, Any]) -> None:
         ]
     )
 
+    # Save all MLP artifacts from inside the worker.
     output_paths = {key: Path(value) for key, value in config["output_paths"].items()}
     output_paths["predictions"].parent.mkdir(parents=True, exist_ok=True)
     predictions.to_parquet(output_paths["predictions"], index=False)
@@ -464,6 +492,7 @@ def train_loop(config: dict[str, Any]) -> None:
 
 
 def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
+    """Load final metrics if Ray returns an empty result metrics object."""
     with open(paths["summary"], "r", encoding="utf-8") as handle:
         saved_summary = json.load(handle)
     return {
@@ -476,6 +505,7 @@ def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
 
+    # Ray environment settings used by the FABRIC run.
     os.environ.setdefault("USE_LIBUV", "0")
     os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
     if not args.use_gpu:
@@ -495,6 +525,7 @@ def main() -> int:
     print(f"Encoded feature count: {len(arrays['feature_names'])}")
     print(f"Ray Train GPU requested: {args.use_gpu}")
 
+    # Build the Ray Train config without changing the feature or output schema.
     train_config = {
         **arrays,
         "run_label": args.run_label,

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
+
+# Path configuration
 SPARK_OUTPUT_DIR = PHASE2_ROOT / "data" / "spark_output" / "output"
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
 FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
@@ -29,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Keep --help usable on a fresh VM before pyarrow is installed.
+# Delay heavier imports so --help still works on a fresh VM.
 if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
     parse_args()
     sys.exit(0)
@@ -39,6 +41,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Feature-table settings
 START_DATE = "2020-04-09"
 END_DATE = "2020-07-16"
 TOP_N_PER_TAG_TYPE = 15
@@ -49,6 +52,7 @@ TARGET_COLUMN = "target_next_count"
 
 
 def read_daily_counts(path: Path, tag_type: str) -> pd.DataFrame:
+    """Read one Spark daily-count parquet folder into a pandas frame."""
     if not path.exists():
         raise FileNotFoundError(f"Missing {tag_type} counts: {path}")
 
@@ -69,6 +73,7 @@ def read_daily_counts(path: Path, tag_type: str) -> pd.DataFrame:
 
 
 def load_counts(spark_output_dir: Path) -> pd.DataFrame:
+    """Load hashtag and cashtag count outputs from Spark."""
     frames = [
         read_daily_counts(spark_output_dir / "daily_hashtag_counts.parquet", "hashtag"),
         read_daily_counts(spark_output_dir / "daily_cashtag_counts.parquet", "cashtag"),
@@ -83,6 +88,7 @@ def load_counts(spark_output_dir: Path) -> pd.DataFrame:
 
 
 def select_top_tags(daily_counts: pd.DataFrame) -> pd.DataFrame:
+    """Pick the most common hashtags and cashtags with enough observed days."""
     summary = (
         daily_counts.groupby(["tag_type", "tag"], as_index=False)
         .agg(total_count=("count", "sum"), observed_days=("date", "nunique"))
@@ -104,6 +110,7 @@ def select_top_tags(daily_counts: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_panel(daily_counts: pd.DataFrame, selected_tags: pd.DataFrame) -> pd.DataFrame:
+    """Build one row for every selected tag on every observed date."""
     dates = pd.DataFrame({"date": sorted(daily_counts["date"].dropna().unique())})
     tags = selected_tags[["tag_type", "tag"]].drop_duplicates().sort_values(["tag_type", "tag"])
 
@@ -115,28 +122,37 @@ def build_panel(daily_counts: pd.DataFrame, selected_tags: pd.DataFrame) -> pd.D
 
 
 def add_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """Add the next-day target and count-history features."""
     features = panel.copy()
     group_cols = ["tag_type", "tag"]
     counts = features.groupby(group_cols, sort=False)["count"]
 
+    # The target is tomorrow's count for the same hashtag or cashtag.
     features[TARGET_COLUMN] = counts.shift(-1)
+
+    # Recent count history gives the models short-term context.
     for lag in [1, 2, 3, 7]:
         features[f"count_lag_{lag}"] = counts.shift(lag)
 
+    # Rolling averages smooth out noisy day-to-day tag movement.
     for window in [3, 7]:
         rolling = counts.rolling(window=window, min_periods=window)
         features[f"rolling_mean_{window}"] = rolling.mean().reset_index(level=group_cols, drop=True)
         features[f"rolling_std_{window}"] = rolling.std().reset_index(level=group_cols, drop=True)
 
+    # One-day change features catch sudden jumps and drops.
     features["count_diff_1"] = features["count"] - features["count_lag_1"]
     features["count_pct_change_1"] = np.where(
         features["count_lag_1"].isna(),
         np.nan,
         np.where(features["count_lag_1"] == 0, 0.0, features["count_diff_1"] / features["count_lag_1"]),
     )
+
+    # Date position helps the model separate weekday and trend effects.
     features["day_of_week"] = features["date"].dt.dayofweek
     features["day_index"] = features.groupby(group_cols).cumcount()
 
+    # These keep a simple trailing 7-day anomaly view for later analysis.
     anomaly_roll = counts.rolling(window=7, min_periods=7)
     features["anomaly_trailing_mean_7"] = anomaly_roll.mean().reset_index(level=group_cols, drop=True)
     features["anomaly_trailing_std_7"] = anomaly_roll.std().reset_index(level=group_cols, drop=True)
@@ -150,6 +166,7 @@ def add_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_splits(features: pd.DataFrame) -> pd.DataFrame:
+    """Add train/validation/test labels by date order."""
     dates = pd.DataFrame({"date": sorted(features["date"].dropna().unique())}).reset_index(names="date_position")
     dates["split"] = np.select(
         [
@@ -181,6 +198,7 @@ def add_splits(features: pd.DataFrame) -> pd.DataFrame:
 
 
 def validate_feature_table(features: pd.DataFrame) -> None:
+    """Check the row counts and target construction expected by the project."""
     tag_counts = features[["tag_type", "tag"]].drop_duplicates().groupby("tag_type").size().to_dict()
     split_counts = features.loc[features["modeling_ready"], "split"].value_counts().to_dict()
     expected_target = features.groupby(["tag_type", "tag"], sort=False)["count"].shift(-1)
@@ -199,17 +217,23 @@ def validate_feature_table(features: pd.DataFrame) -> None:
 def main() -> int:
     args = parse_args()
 
+    # loading input data
     print("Loading daily counts")
     daily_counts = load_counts(args.spark_output_dir)
 
+    # selecting top tags and building the daily panel
     print("Building feature table")
     selected_tags = select_top_tags(daily_counts)
     panel = build_panel(daily_counts, selected_tags)
+
+    # adding lag, rolling, and target columns
     features = add_features(panel)
 
+    # applying date splits and final checks
     features = add_splits(features)
     validate_feature_table(features)
 
+    # saving outputs
     args.output.parent.mkdir(parents=True, exist_ok=True)
     features.to_parquet(args.output, index=False)
 

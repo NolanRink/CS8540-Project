@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
+
+# Path and run settings
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
 FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
 RUN_LABEL = "count_only"
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Let --help work even before Ray/sklearn are installed on a new VM.
+# Delay ML imports so --help still works on a new VM.
 if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
     parse_args()
     sys.exit(0)
@@ -56,6 +58,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
+# Feature columns used by the classical models
 TARGET_COLUMN = "target_next_count"
 BASE_NUMERIC_FEATURES = [
     "count",
@@ -73,6 +76,7 @@ BASE_NUMERIC_FEATURES = [
 CATEGORICAL_FEATURES = ["tag", "tag_type"]
 OFFICIAL_BASELINE = "baseline_last_value"
 
+# Classical model settings. These values are part of the final comparison.
 MODEL_CONFIGS: list[dict[str, Any]] = [
     {"name": "linear_regression_pooled", "kind": "linear_regression"},
     {"name": "ridge_regression_pooled", "kind": "ridge", "alpha": 10.0},
@@ -100,12 +104,14 @@ NUM_WORKERS = min(4, len(MODEL_CONFIGS))
 
 
 def labeled_path(path: Path, run_label: str | None) -> Path:
+    """Append the run label to an output file name."""
     if run_label is None:
         return path
     return path.with_name(f"{path.stem}_{run_label}{path.suffix}")
 
 
 def output_paths(run_label: str | None) -> dict[str, Path]:
+    """Build the output file paths for this run label."""
     names = {
         "baseline_predictions": "baseline_forecast_predictions.parquet",
         "baseline_metrics_overall": "baseline_forecast_metrics_overall.csv",
@@ -122,6 +128,7 @@ def output_paths(run_label: str | None) -> dict[str, Path]:
 
 
 def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> float:
+    """Return symmetric MAPE as a percentage."""
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
     denominator = (np.abs(actual) + np.abs(predicted)) / 2
@@ -130,6 +137,7 @@ def smape_percent(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndar
 
 
 def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str, float | int]:
+    """Build one MAE/RMSE/sMAPE metric row."""
     actual_values = np.asarray(actual, dtype=float)
     predicted_values = np.asarray(predicted, dtype=float)
     return {
@@ -141,6 +149,7 @@ def metric_row(actual: pd.Series, predicted: pd.Series | np.ndarray) -> dict[str
 
 
 def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
+    """Load the feature table rows that are ready for modeling."""
     if not feature_path.exists():
         raise FileNotFoundError(f"Missing feature table: {feature_path}")
 
@@ -175,6 +184,7 @@ def load_modeling_frame(feature_path: Path) -> tuple[pd.DataFrame, list[str]]:
 
 
 def make_encoder() -> OneHotEncoder:
+    """Create a dense one-hot encoder that works across sklearn versions."""
     try:
         return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
@@ -182,6 +192,7 @@ def make_encoder() -> OneHotEncoder:
 
 
 def build_model(config: dict[str, Any]):
+    """Create the sklearn model described by one config dictionary."""
     kind = config["kind"]
     if kind == "linear_regression":
         return LinearRegression()
@@ -207,6 +218,7 @@ def build_model(config: dict[str, Any]):
 
 
 def build_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str]) -> Pipeline:
+    """Build preprocessing plus the chosen sklearn model."""
     preprocessor = ColumnTransformer(
         [
             (
@@ -225,7 +237,10 @@ def build_pipeline(model_config: dict[str, Any], numeric_feature_names: list[str
 
 
 def run_baselines(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Score simple non-Ray baselines for comparison."""
     predictions = modeling[["date", "tag", "tag_type", "count", TARGET_COLUMN, "split"]].copy()
+
+    # Baselines use values that are already available at prediction time.
     predictions["baseline_last_value"] = modeling["count"].astype(float)
     predictions["baseline_rolling_mean_3"] = modeling["rolling_mean_3"].astype(float)
     predictions["baseline_rolling_mean_7"] = modeling["rolling_mean_7"].astype(float)
@@ -239,6 +254,7 @@ def run_baselines(modeling: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]
 
     overall_rows = []
+    # Validation and test metrics make the baselines comparable to learned models.
     for split_name in ["validation", "test"]:
         split_frame = predictions[predictions["split"] == split_name]
         for baseline in baseline_names:
@@ -287,6 +303,7 @@ def train_model_worker(
     validation_frame: pd.DataFrame,
     test_frame: pd.DataFrame,
 ) -> dict[str, Any]:
+    """Fit one sklearn model inside a Ray worker."""
     model_name = model_config["name"]
     feature_cols = numeric_feature_names + CATEGORICAL_FEATURES
     pipeline = build_pipeline(model_config, numeric_feature_names)
@@ -314,6 +331,7 @@ def train_model_worker(
 
 
 def start_ray(num_workers: int, num_cpus: int | None) -> int:
+    """Start Ray and return the CPU count used by each worker."""
     if num_workers < 1:
         raise ValueError("NUM_WORKERS must be at least 1")
     if num_cpus is not None and num_cpus < 1:
@@ -344,6 +362,7 @@ def run_ray_models(
     num_workers: int,
     num_cpus: int | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Train the configured sklearn models in parallel with Ray."""
     train = modeling[modeling["split"] == "train"].copy()
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
@@ -378,6 +397,7 @@ def add_baseline_to_comparison(
     baseline_predictions: pd.DataFrame,
     baseline_metrics: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Add the official last-value baseline beside the learned model outputs."""
     baseline_comparison = (
         baseline_predictions[baseline_predictions["split"].isin(["validation", "test"])][
             ["date", "tag", "tag_type", TARGET_COLUMN, "split", OFFICIAL_BASELINE]
@@ -406,6 +426,7 @@ def add_baseline_to_comparison(
 
 
 def summarize_by_tag(predictions: pd.DataFrame, best_model: str) -> pd.DataFrame:
+    """Summarize test metrics for the selected learned model by tag."""
     rows = []
     best_test = predictions[(predictions["split"] == "test") & (predictions["model"] == best_model)]
     for (tag_type, tag), group in best_test.groupby(["tag_type", "tag"]):
@@ -414,6 +435,7 @@ def summarize_by_tag(predictions: pd.DataFrame, best_model: str) -> pd.DataFrame
 
 
 def summarize_by_tag_type(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Summarize validation/test metrics by hashtag versus cashtag."""
     rows = []
     for (split_name, tag_type, model), group in predictions.groupby(["split", "tag_type", "model"]):
         rows.append({"split": split_name, "tag_type": tag_type, "model": model, **metric_row(group[TARGET_COLUMN], group["prediction"])})
@@ -430,6 +452,7 @@ def save_outputs(
     baseline_outputs: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
     paths: dict[str, Path],
 ) -> None:
+    """Save the baseline, Ray model, metric, and summary outputs."""
     DERIVED_DIR.mkdir(parents=True, exist_ok=True)
     baseline_predictions, baseline_metrics, baseline_by_tag, baseline_by_type = baseline_outputs
 
@@ -448,6 +471,7 @@ def save_outputs(
 
 
 def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> None:
+    """Update the shared comparison CSV for this run label."""
     if run_label is None:
         return
 
@@ -470,16 +494,19 @@ def main() -> int:
     args = parse_args()
     paths = output_paths(args.run_label)
 
+    # loading input data
     print("Loading features")
     modeling, selected_numeric = load_modeling_frame(args.features)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
     print(f"Rows by split: {split_counts}")
     print(f"Numeric feature count: {len(selected_numeric)}")
 
+    # scoring baselines
     print("Scoring baselines")
     baseline_outputs = run_baselines(modeling)
     baseline_predictions, baseline_metrics, _, _ = baseline_outputs
 
+    # training Ray models
     print("Training Ray models")
     learned_predictions, learned_metrics, training_times = run_ray_models(
         modeling,
@@ -494,6 +521,7 @@ def main() -> int:
         baseline_metrics,
     )
 
+    # choosing the learned model by validation metrics
     validation_metrics = all_metrics[all_metrics["split"] == "validation"].sort_values(["sMAPE", "MAE"])
     test_metrics = all_metrics[all_metrics["split"] == "test"].sort_values(["sMAPE", "MAE"])
     learned_names = [model_config["name"] for model_config in MODEL_CONFIGS]
@@ -516,6 +544,7 @@ def main() -> int:
     if len(all_predictions) != expected_prediction_rows:
         raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
 
+    # saving outputs
     run_summary = {
         "run_label": args.run_label,
         "features": str(args.features),
