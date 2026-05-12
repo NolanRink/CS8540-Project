@@ -16,22 +16,30 @@ unset PYTHONPATH
 export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
 export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
 
-# Spark script handles these paths now.
-SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
+SPARK_INPUT="phase2/data/spark_output/stock_tweets.csv"
 SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
 FEATURE_TABLE="phase2/data/derived/top_tags_daily_features.parquet"
 DATA_URL="https://huggingface.co/datasets/StephanAkkerman/stock-market-tweets-data/resolve/main/stock-market-tweets-data.csv"
 
+mkdir -p phase2/data/spark_output phase2/data/derived "$SPARK_OUTPUT_DIR"
+
 if [ ! -f "$SPARK_INPUT" ]; then
   echo "Downloading stock tweet data"
-  mkdir -p "$(dirname "$SPARK_INPUT")"
   curl -L "$DATA_URL" -o "$SPARK_INPUT"
 fi
+
+# Older copies of spark_pipeline.py read stock_tweets.csv from the repo root.
+cp "$SPARK_INPUT" stock_tweets.csv
 
 echo "Running Spark preprocessing"
 .venv/bin/spark-submit phase2/spark_pipeline.py \
   --input "$SPARK_INPUT" \
   --output-dir "$SPARK_OUTPUT_DIR"
+
+if [ -d output/daily_hashtag_counts.parquet ]; then
+  echo "Copying Spark output into phase2 data folder"
+  cp -r output/*.parquet "$SPARK_OUTPUT_DIR"/
+fi
 
 echo "Building feature table"
 python phase2/scripts/build_feature_table.py \
