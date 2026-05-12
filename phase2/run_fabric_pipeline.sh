@@ -19,6 +19,13 @@ export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
 # Override SPARK_INPUT if the raw CSV is somewhere else on FABRIC.
 SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
 SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
+DATA_URL="https://huggingface.co/datasets/StephanAkkerman/stock-market-tweets-data/resolve/main/stock-market-tweets-data.csv"
+
+if [ ! -f "$SPARK_INPUT" ]; then
+  echo "Downloading stock tweet data"
+  mkdir -p "$(dirname "$SPARK_INPUT")"
+  curl -L "$DATA_URL" -o "$SPARK_INPUT"
+fi
 
 echo "Running Spark preprocessing"
 .venv/bin/spark-submit phase2/spark_pipeline.py \
