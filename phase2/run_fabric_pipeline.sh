@@ -16,8 +16,8 @@ unset PYTHONPATH
 export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
 export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
 
-# Override SPARK_INPUT if the raw CSV is somewhere else on FABRIC.
-SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
+# The Spark script reads stock_tweets.csv from the repo root unless SPARK_INPUT is changed.
+SPARK_INPUT="${SPARK_INPUT:-stock_tweets.csv}"
 SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
 DATA_URL="https://huggingface.co/datasets/StephanAkkerman/stock-market-tweets-data/resolve/main/stock-market-tweets-data.csv"
 
