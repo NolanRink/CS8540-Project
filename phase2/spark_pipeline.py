@@ -29,22 +29,22 @@ df = df.withColumn("cashtags", cashtag_udf("text"))
 df = df.withColumn("date", to_date(col("created_at")))
 df = df.withColumn("week", date_trunc("week", col("date")))
 
-os.makedirs("output", exist_ok=True)
+os.makedirs("phase2/data/spark_output/output", exist_ok=True)
 
 df.select("date", explode("hashtags").alias("tag")) \
     .groupBy("date", "tag").count().orderBy("date", col("count").desc()) \
-    .write.mode("overwrite").parquet("output/daily_hashtag_counts.parquet")
+    .write.mode("overwrite").parquet("phase2/data/spark_output/output/daily_hashtag_counts.parquet")
 
 df.select("date", explode("cashtags").alias("tag")) \
     .groupBy("date", "tag").count().orderBy("date", col("count").desc()) \
-    .write.mode("overwrite").parquet("output/daily_cashtag_counts.parquet")
+    .write.mode("overwrite").parquet("phase2/data/spark_output/output/daily_cashtag_counts.parquet")
 
 df.select("week", explode("hashtags").alias("tag")) \
     .groupBy("week", "tag").count().orderBy("week", col("count").desc()) \
-    .write.mode("overwrite").parquet("output/weekly_hashtag_counts.parquet")
+    .write.mode("overwrite").parquet("phase2/data/spark_output/output/weekly_hashtag_counts.parquet")
 
 df.select("date", "text", "hashtags", "cashtags") \
-    .write.mode("overwrite").parquet("output/cleaned_tweets.parquet")
+    .write.mode("overwrite").parquet("phase2/data/spark_output/output/cleaned_tweets.parquet")
 
 print("\nTop 10 Hashtags:")
 df.select(explode("hashtags").alias("tag")).groupBy("tag").count() \
@@ -54,5 +54,5 @@ print("\nTop 10 Cashtags:")
 df.select(explode("cashtags").alias("tag")).groupBy("tag").count() \
     .orderBy(col("count").desc()).show(10)
 
-print("\nDone. Outputs saved to ./output/")
+print("\nDone. Outputs saved to ./phase2/data/spark_output/output/")
 spark.stop()
