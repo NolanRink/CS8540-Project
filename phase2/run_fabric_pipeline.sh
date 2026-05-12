@@ -8,13 +8,20 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r phase2/requirements-phase2.txt
+python -m pip install --force-reinstall "pyspark==3.5.1"
 
-# # Override SPARK_INPUT if the raw CSV is somewhere else on FABRIC.
-# SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
-# SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
+# Use the venv Spark, not any old system Spark install.
+unset SPARK_HOME
+unset PYTHONPATH
+export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
+export PYSPARK_DRIVER_PYTHON="$(pwd)/.venv/bin/python"
+
+# Override SPARK_INPUT if the raw CSV is somewhere else on FABRIC.
+SPARK_INPUT="${SPARK_INPUT:-phase2/data/spark_output/stock_tweets.csv}"
+SPARK_OUTPUT_DIR="phase2/data/spark_output/output"
 
 echo "Running Spark preprocessing"
-spark-submit phase2/spark_pipeline.py \
+.venv/bin/spark-submit phase2/spark_pipeline.py \
   --input "$SPARK_INPUT" \
   --output-dir "$SPARK_OUTPUT_DIR"
 
