@@ -1,18 +1,43 @@
 """Build the daily feature table for the selected Phase 2 tags."""
 
+import argparse
 import sys
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 
 PHASE2_ROOT = Path(__file__).resolve().parents[1]
 SPARK_OUTPUT_DIR = PHASE2_ROOT / "data" / "spark_output" / "output"
 DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
 FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the Phase 2 count-only forecasting feature table from Spark daily tag counts."
+    )
+    parser.add_argument(
+        "--spark-output-dir",
+        type=Path,
+        default=SPARK_OUTPUT_DIR,
+        help="Directory containing Spark output folders. Defaults to phase2/data/spark_output/output.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=FEATURE_TABLE_PATH,
+        help="Feature table parquet output path. Defaults to phase2/data/derived/top_tags_daily_features.parquet.",
+    )
+    return parser.parse_args()
+
+
+# Keep --help usable on a fresh VM before pyarrow is installed.
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    parse_args()
+    sys.exit(0)
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 START_DATE = "2020-04-09"
 END_DATE = "2020-07-16"
@@ -172,8 +197,10 @@ def validate_feature_table(features: pd.DataFrame) -> None:
 
 
 def main() -> int:
+    args = parse_args()
+
     print("Loading daily counts")
-    daily_counts = load_counts(SPARK_OUTPUT_DIR)
+    daily_counts = load_counts(args.spark_output_dir)
 
     print("Building feature table")
     selected_tags = select_top_tags(daily_counts)
@@ -183,10 +210,10 @@ def main() -> int:
     features = add_splits(features)
     validate_feature_table(features)
 
-    FEATURE_TABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(FEATURE_TABLE_PATH, index=False)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    features.to_parquet(args.output, index=False)
 
-    print(f"Saved {FEATURE_TABLE_PATH}")
+    print(f"Saved {args.output}")
     print(f"Rows: {len(features):,}; modeling-ready rows: {int(features['modeling_ready'].sum()):,}")
     return 0
 

@@ -1,11 +1,48 @@
 """Run the Phase 2 forecasting baselines and pooled Ray models."""
 
+import argparse
 import json
 import logging
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+PHASE2_ROOT = Path(__file__).resolve().parents[1]
+DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
+RUN_LABEL = "count_only"
+NUM_CPUS = 4
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Phase 2 classical Ray forecasting comparison."
+    )
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=FEATURE_TABLE_PATH,
+        help="Input feature table parquet path.",
+    )
+    parser.add_argument(
+        "--run-label",
+        default=RUN_LABEL,
+        help="Label appended to output files.",
+    )
+    parser.add_argument(
+        "--num-cpus",
+        type=int,
+        default=NUM_CPUS,
+        help="Total CPUs to give Ray for the classical model run.",
+    )
+    return parser.parse_args()
+
+
+# Let --help work even before Ray/sklearn are installed on a new VM.
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    parse_args()
+    sys.exit(0)
 
 import numpy as np
 import pandas as pd
@@ -19,11 +56,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
-PHASE2_ROOT = Path(__file__).resolve().parents[1]
-DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
-FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
-RUN_LABEL = "count_only"
-NUM_CPUS = 4
 TARGET_COLUMN = "target_next_count"
 BASE_NUMERIC_FEATURES = [
     "count",
@@ -281,7 +313,7 @@ def train_model_worker(
     }
 
 
-def start_ray(num_workers: int, num_cpus: int | None) -> tuple[int, float]:
+def start_ray(num_workers: int, num_cpus: int | None) -> int:
     if num_workers < 1:
         raise ValueError("NUM_WORKERS must be at least 1")
     if num_cpus is not None and num_cpus < 1:
@@ -303,7 +335,7 @@ def start_ray(num_workers: int, num_cpus: int | None) -> tuple[int, float]:
         print("Ray sees GPU resources, but these sklearn models are CPU-bound.")
 
     cpus_per_worker = max(1, total_cpus // max(1, num_workers))
-    return cpus_per_worker, 0.0
+    return cpus_per_worker
 
 
 def run_ray_models(
@@ -316,10 +348,10 @@ def run_ray_models(
     validation = modeling[modeling["split"] == "validation"].copy()
     test = modeling[modeling["split"] == "test"].copy()
 
-    cpus_per_worker, gpus_per_worker = start_ray(num_workers, num_cpus)
+    cpus_per_worker = start_ray(num_workers, num_cpus)
     try:
         futures = [
-            train_model_worker.options(num_cpus=cpus_per_worker, num_gpus=gpus_per_worker).remote(
+            train_model_worker.options(num_cpus=cpus_per_worker, num_gpus=0).remote(
                 model_config,
                 numeric_feature_names,
                 train,
@@ -435,10 +467,11 @@ def update_forecast_comparison(metrics: pd.DataFrame, run_label: str | None) -> 
 
 
 def main() -> int:
-    paths = output_paths(RUN_LABEL)
+    args = parse_args()
+    paths = output_paths(args.run_label)
 
     print("Loading features")
-    modeling, selected_numeric = load_modeling_frame(FEATURE_TABLE_PATH)
+    modeling, selected_numeric = load_modeling_frame(args.features)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
     print(f"Rows by split: {split_counts}")
     print(f"Numeric feature count: {len(selected_numeric)}")
@@ -452,7 +485,7 @@ def main() -> int:
         modeling,
         selected_numeric,
         NUM_WORKERS,
-        NUM_CPUS,
+        args.num_cpus,
     )
     all_predictions, all_metrics = add_baseline_to_comparison(
         learned_predictions,
@@ -474,7 +507,7 @@ def main() -> int:
     by_tag = summarize_by_tag(all_predictions, best_model)
     by_tag_type = summarize_by_tag_type(all_predictions)
     training_times = training_times.copy()
-    training_times.insert(0, "run_label", RUN_LABEL)
+    training_times.insert(0, "run_label", args.run_label)
     training_times["feature_set"] = "count_only"
     training_times["rows_train"] = int((modeling["split"] == "train").sum())
     training_times["num_numeric_features"] = len(selected_numeric)
@@ -484,8 +517,8 @@ def main() -> int:
         raise ValueError(f"Unexpected prediction row count: {len(all_predictions)}")
 
     run_summary = {
-        "run_label": RUN_LABEL,
-        "features": str(FEATURE_TABLE_PATH),
+        "run_label": args.run_label,
+        "features": str(args.features),
         "include_sentiment": False,
         "official_baseline": OFFICIAL_BASELINE,
         "best_learned_model": best_model,
@@ -501,7 +534,7 @@ def main() -> int:
 
     print("Saving results")
     save_outputs(all_predictions, all_metrics, by_tag, by_tag_type, training_times, run_summary, baseline_outputs, paths)
-    update_forecast_comparison(all_metrics, RUN_LABEL)
+    update_forecast_comparison(all_metrics, args.run_label)
 
     print(f"Best learned model: {best_model}")
     print(f"Validation sMAPE: {best_validation['sMAPE']:.4f}; test sMAPE: {best_test['sMAPE']:.4f}")

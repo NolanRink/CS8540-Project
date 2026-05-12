@@ -1,11 +1,69 @@
 """Train a small Ray Train PyTorch MLP for next-day tag-count forecasting."""
 
+import argparse
 import json
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+PHASE2_ROOT = Path(__file__).resolve().parents[1]
+DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
+FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
+RUN_LABEL = "mlp_count_only"
+NUM_WORKERS = 1
+USE_GPU = True
+EPOCHS = 100
+BATCH_SIZE = 64
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train the final Phase 2 Ray Train PyTorch MLP forecaster."
+    )
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=FEATURE_TABLE_PATH,
+        help="Input feature table parquet path.",
+    )
+    parser.add_argument(
+        "--run-label",
+        default=RUN_LABEL,
+        help="Label appended to MLP output files.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=NUM_WORKERS,
+        help="Number of Ray Train workers.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=EPOCHS,
+        help="Number of training epochs.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help="Training batch size.",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        default=USE_GPU,
+        help="Request GPU training. Enabled by default for the final Phase 2 workflow.",
+    )
+    return parser.parse_args()
+
+
+# Let --help work before Ray/Torch are installed.
+if any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    parse_args()
+    sys.exit(0)
 
 import numpy as np
 import pandas as pd
@@ -18,14 +76,6 @@ from ray.train import ScalingConfig
 from ray.train.torch import TorchConfig, TorchTrainer
 
 
-PHASE2_ROOT = Path(__file__).resolve().parents[1]
-DERIVED_DIR = PHASE2_ROOT / "data" / "derived"
-FEATURE_TABLE_PATH = DERIVED_DIR / "top_tags_daily_features.parquet"
-RUN_LABEL = "mlp_count_only"
-NUM_WORKERS = 1
-USE_GPU = True
-EPOCHS = 100
-BATCH_SIZE = 64
 HIDDEN_SIZE = 64
 DROPOUT = 0.1
 LEARNING_RATE = 1e-3
@@ -154,6 +204,7 @@ def prepare_arrays(modeling: pd.DataFrame, numeric_features: list[str]) -> dict[
         target_std = 1.0
     y_scaled = (y - target_mean) / target_std
 
+    # Ray Train gets plain numpy arrays; the original rows are kept for saved predictions.
     arrays: dict[str, Any] = {
         "feature_names": feature_frame.columns.tolist(),
         "numeric_features": numeric_features,
@@ -250,6 +301,7 @@ def train_loop(config: dict[str, Any]) -> None:
     loss_fn = nn.SmoothL1Loss()
 
     def predict_counts(x_values: np.ndarray) -> np.ndarray:
+        # The network trains on a standardized target, so convert predictions back to counts.
         model.eval()
         x_tensor = torch.tensor(x_values, dtype=torch.float32, device=device)
         predictions = []
@@ -422,40 +474,42 @@ def metrics_from_saved_summary(paths: dict[str, Path]) -> dict[str, Any]:
 
 
 def main() -> int:
+    args = parse_args()
+
     os.environ.setdefault("USE_LIBUV", "0")
     os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    if not USE_GPU:
+    if not args.use_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-    if USE_GPU and not torch.cuda.is_available():
+    if args.use_gpu and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. Run this final MLP script on a FABRIC GPU node.")
 
     print("Loading features")
-    modeling, numeric_features = load_modeling_frame(FEATURE_TABLE_PATH)
+    modeling, numeric_features = load_modeling_frame(args.features)
     arrays = prepare_arrays(modeling, numeric_features)
-    paths = output_paths(RUN_LABEL)
+    paths = output_paths(args.run_label)
     split_counts = modeling["split"].value_counts().reindex(["train", "validation", "test"]).to_dict()
 
     print(f"Rows by split: {split_counts}")
     print(f"Numeric features: {len(numeric_features)}")
     print(f"Encoded feature count: {len(arrays['feature_names'])}")
-    print(f"Ray Train GPU requested: {USE_GPU}")
+    print(f"Ray Train GPU requested: {args.use_gpu}")
 
     train_config = {
         **arrays,
-        "run_label": RUN_LABEL,
-        "features": str(FEATURE_TABLE_PATH),
+        "run_label": args.run_label,
+        "features": str(args.features),
         "include_sentiment": False,
         "input_dim": len(arrays["feature_names"]),
         "hidden_size": HIDDEN_SIZE,
         "dropout": DROPOUT,
-        "epochs": EPOCHS,
-        "batch_size": BATCH_SIZE,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "seed": SEED,
-        "num_workers": NUM_WORKERS,
-        "use_gpu": USE_GPU,
+        "num_workers": args.num_workers,
+        "use_gpu": args.use_gpu,
         "output_paths": {key: str(value) for key, value in paths.items()},
         "classical_reference": find_classical_reference(),
     }
@@ -464,7 +518,7 @@ def main() -> int:
     trainer = TorchTrainer(
         train_loop_per_worker=train_loop,
         train_loop_config=train_config,
-        scaling_config=ScalingConfig(num_workers=NUM_WORKERS, use_gpu=USE_GPU),
+        scaling_config=ScalingConfig(num_workers=args.num_workers, use_gpu=args.use_gpu),
         torch_config=TorchConfig(backend="gloo"),
     )
     result = trainer.fit()
